@@ -1,0 +1,71 @@
+# ==============================================================================
+# StudyLink .gitignore
+# ==============================================================================
+
+# Maven build outputs
+target/
+**/target/
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# Preserve the Maven Wrapper scripts and properties
+!mvnw
+!mvnw.cmd
+!.mvn/
+!.mvn/wrapper/
+!.mvn/wrapper/maven-wrapper.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# Local runtime configuration overrides (preserve committed example config)
+config/studylink.properties
+config/*.local.properties
+!config/studylink.example.properties
+
+# Runtime room file storage, local TLS stores, scratch reference files and uploads
+var/
+local/
+reference-local/
+uploads/
+tmp/
+*.tmp
+*.part
+
+# Generated TLS keystores, truststores, private keys, certificates and secrets
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.truststore
+*.key
+*.pem
+*.crt
+*.cer
+*.csr
+*.der
+.env
+.env.*
+*secret*
+
+# Preserve the approved baseline report PDF
+!docs/report/StudyLink_Project_Report_and_SRS.pdf
+
+# IDE and OS metadata
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+.factorypath
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+hs_err_pid*
+replay_pid*

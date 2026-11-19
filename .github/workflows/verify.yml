@@ -1,0 +1,44 @@
+name: Verify StudyLink Build
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Verify Java and Maven Wrapper versions
+        run: |
+          java -version
+          javac -version
+          chmod +x ./mvnw
+          ./mvnw -v
+
+      - name: Build reactor, run JUnit tests and package shaded JARs
+        run: ./mvnw clean verify
+
+      - name: Run headless server and client JAR checks
+        run: |
+          test -f server/target/studylink-server.jar
+          test -f client/target/studylink-client.jar
+          java -jar server/target/studylink-server.jar --help
+          java -jar client/target/studylink-client.jar --help
+          java -jar server/target/studylink-server.jar --config config/studylink.example.properties --check-config
+          java -jar client/target/studylink-client.jar --config config/studylink.example.properties --check-config
