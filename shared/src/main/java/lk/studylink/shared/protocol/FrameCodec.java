@@ -6,6 +6,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
@@ -20,6 +21,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -71,7 +73,11 @@ import java.util.Optional;
  */
 public final class FrameCodec {
 
-    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+    private static final Gson GSON = new GsonBuilder()
+            .serializeNulls()
+            .disableHtmlEscaping()
+            .setStrictness(Strictness.STRICT)
+            .create();
 
     private FrameCodec() {
     }
@@ -179,18 +185,61 @@ public final class FrameCodec {
     }
 
     /**
-     * Serializes a {@link JsonObject} to UTF-8 bytes and verifies that its byte length is within
-     * {@code 1..16,384} bytes.
+     * Serializes a {@link JsonObject} to UTF-8 bytes, preserving explicit JSON {@code null} fields,
+     * rejecting non-finite numeric values ({@code NaN}, {@code Infinity}, {@code -Infinity}), and
+     * verifying that its UTF-8 byte length is within {@code 1..16,384} bytes.
      *
      * @param payload JSON object payload (must not be {@code null})
      * @return UTF-8 encoded JSON object bytes
-     * @throws FrameFormatException if the encoded byte length is outside {@code 1..16,384}
+     * @throws FrameFormatException if the payload contains non-finite numbers or the encoded byte
+     *                              length is outside {@code 1..16,384}
      */
     public static byte[] encodePayloadBytes(JsonObject payload) throws FrameFormatException {
         Objects.requireNonNull(payload, "payload must not be null");
-        byte[] utf8 = GSON.toJson(payload).getBytes(StandardCharsets.UTF_8);
+        validateOutboundElement(payload);
+        final String json;
+        try {
+            json = GSON.toJson(payload);
+        } catch (IllegalArgumentException | JsonParseException e) {
+            throw new FrameFormatException("Frame payload contains invalid JSON value: " + e.getMessage(), e);
+        }
+        byte[] utf8 = json.getBytes(StandardCharsets.UTF_8);
         validatePayloadLength(utf8.length);
         return utf8;
+    }
+
+    private static void validateOutboundElement(JsonElement element) throws FrameFormatException {
+        if (element == null || element.isJsonNull()) {
+            return;
+        }
+        if (element.isJsonObject()) {
+            for (Map.Entry<String, JsonElement> entry : element.getAsJsonObject().entrySet()) {
+                validateOutboundElement(entry.getValue());
+            }
+            return;
+        }
+        if (element.isJsonArray()) {
+            for (JsonElement item : element.getAsJsonArray()) {
+                validateOutboundElement(item);
+            }
+            return;
+        }
+        if (element.isJsonPrimitive()) {
+            JsonPrimitive primitive = element.getAsJsonPrimitive();
+            if (primitive.isNumber()) {
+                Number number = primitive.getAsNumber();
+                if (number instanceof Double d && (!Double.isFinite(d))) {
+                    throw new FrameFormatException("Frame payload contains non-finite numeric value: " + d);
+                }
+                if (number instanceof Float f && (!Float.isFinite(f))) {
+                    throw new FrameFormatException("Frame payload contains non-finite numeric value: " + f);
+                }
+                double asDouble = number.doubleValue();
+                if (Double.isNaN(asDouble)) {
+                    throw new FrameFormatException("Frame payload contains NaN numeric value");
+                }
+            }
+        }
     }
 
     /**

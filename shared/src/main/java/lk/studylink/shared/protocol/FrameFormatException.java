@@ -7,7 +7,7 @@ import java.io.IOException;
  * <ul>
  *   <li>declared or encoded payload length outside {@code 1..16,384} bytes,</li>
  *   <li>malformed or unmappable UTF-8 byte sequences,</li>
- *   <li>malformed JSON syntax or trailing non-whitespace tokens, or</li>
+ *   <li>malformed JSON syntax, non-finite numeric values ({@code NaN}, {@code Infinity}), or trailing non-whitespace tokens, or</li>
  *   <li>a JSON root value that is not a JSON object.</li>
  * </ul>
  */

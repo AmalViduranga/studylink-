@@ -2,10 +2,14 @@ package lk.studylink.shared.protocol;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -265,6 +269,106 @@ class FrameCodecTest {
 
         assertThrows(FrameFormatException.class, () -> FrameCodec.writeFrame(out, oversized));
         assertEquals(0, out.size(), "Oversized outbound frame must not write any partial prefix or payload bytes");
+    }
+
+    @Test
+    void preservesExplicitNullFieldsAtTopLevelAndNestedObjectsAndDistinguishesMissingProperties() throws IOException {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("v", 1);
+        payload.add("topNull", JsonNull.INSTANCE);
+        JsonObject data = new JsonObject();
+        data.add("roomId", JsonNull.INSTANCE);
+        payload.add("data", data);
+
+        String expectedJson = "{\"v\":1,\"topNull\":null,\"data\":{\"roomId\":null}}";
+        assertEquals(expectedJson, new String(FrameCodec.encodePayloadBytes(payload), StandardCharsets.UTF_8));
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        FrameCodec.writeFrame(out, payload);
+        JsonObject decoded = FrameCodec.readFrame(new ByteArrayInputStream(out.toByteArray()));
+        assertNotNull(decoded);
+
+        // Top-level explicit null vs missing key
+        assertTrue(decoded.has("topNull"), "Top-level explicit null key must be preserved");
+        assertTrue(decoded.get("topNull").isJsonNull(), "Top-level explicit null value must be JsonNull");
+        assertEquals(JsonNull.INSTANCE, decoded.get("topNull"));
+        assertFalse(decoded.has("missingTop"), "Omitted top-level key must remain absent");
+        assertNull(decoded.get("missingTop"));
+
+        // Nested explicit null vs missing key
+        JsonObject decodedData = decoded.getAsJsonObject("data");
+        assertNotNull(decodedData);
+        assertTrue(decodedData.has("roomId"), "Nested explicit null key 'roomId' must be preserved");
+        assertTrue(decodedData.get("roomId").isJsonNull(), "Nested 'roomId' value must be JsonNull");
+        assertEquals(JsonNull.INSTANCE, decodedData.get("roomId"));
+        assertFalse(decodedData.has("missingNested"), "Omitted nested key must remain absent");
+        assertNull(decodedData.get("missingNested"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(doubles = {
+            Double.NaN,
+            Double.POSITIVE_INFINITY,
+            Double.NEGATIVE_INFINITY
+    })
+    void rejectsNonFiniteNumbersOnOutboundWriteAndEncodeWithZeroBytesWritten(double nonFinite) {
+        // 1. Direct top-level numeric property
+        JsonObject topLevel = new JsonObject();
+        topLevel.addProperty("v", 1);
+        topLevel.addProperty("metric", nonFinite);
+
+        ByteArrayOutputStream topOut = new ByteArrayOutputStream();
+        assertThrows(FrameFormatException.class, () -> FrameCodec.writeFrame(topOut, topLevel));
+        assertEquals(0, topOut.size(), "writeFrame must write 0 bytes when rejecting top-level non-finite number");
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodeFrameBytes(topLevel));
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodePayloadBytes(topLevel));
+
+        // 2. Nested object numeric property
+        JsonObject nestedObj = new JsonObject();
+        nestedObj.addProperty("v", 1);
+        JsonObject child = new JsonObject();
+        child.addProperty("latency", nonFinite);
+        nestedObj.add("data", child);
+
+        ByteArrayOutputStream nestedOut = new ByteArrayOutputStream();
+        assertThrows(FrameFormatException.class, () -> FrameCodec.writeFrame(nestedOut, nestedObj));
+        assertEquals(0, nestedOut.size(), "writeFrame must write 0 bytes when rejecting nested non-finite number");
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodeFrameBytes(nestedObj));
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodePayloadBytes(nestedObj));
+
+        // 3. Nested array numeric element
+        JsonObject arrayHolder = new JsonObject();
+        arrayHolder.addProperty("v", 1);
+        JsonArray array = new JsonArray();
+        array.add(1.0);
+        array.add(nonFinite);
+        arrayHolder.add("samples", array);
+
+        ByteArrayOutputStream arrayOut = new ByteArrayOutputStream();
+        assertThrows(FrameFormatException.class, () -> FrameCodec.writeFrame(arrayOut, arrayHolder));
+        assertEquals(0, arrayOut.size(), "writeFrame must write 0 bytes when rejecting array non-finite number");
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodeFrameBytes(arrayHolder));
+        assertThrows(FrameFormatException.class, () -> FrameCodec.encodePayloadBytes(arrayHolder));
+    }
+
+    @Test
+    void acceptsFiniteNumbersAndLiteralNaNStringOnRoundTrip() throws IOException {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("v", 1);
+        payload.addProperty("zero", 0);
+        payload.addProperty("negativeInt", -42);
+        payload.addProperty("decimal", 3.14159);
+        payload.addProperty("statusText", "NaN");
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        FrameCodec.writeFrame(out, payload);
+
+        JsonObject decoded = FrameCodec.readFrame(new ByteArrayInputStream(out.toByteArray()));
+        assertEquals(payload, decoded);
+        assertEquals(0, decoded.get("zero").getAsInt());
+        assertEquals(-42, decoded.get("negativeInt").getAsInt());
+        assertEquals(3.14159, decoded.get("decimal").getAsDouble(), 1e-9);
+        assertEquals("NaN", decoded.get("statusText").getAsString());
     }
 
     private static JsonObject buildPayloadWithExactUtf8Size(int targetBytes) {
