@@ -2,7 +2,7 @@
 
 - **Baseline reference:** [StudyLink Project Report and SRS](../report/StudyLink_Project_Report_and_SRS.pdf) (Sections 3, 5, and 6.3–6.4)
 - **Protocol version:** `v = 1`
-- **Current implementation status:** In the Phase-0 starter baseline, protocol constants and port defaults are defined in `lk.studylink.shared.protocol.ProtocolConstants` and `config/studylink.example.properties`. Active socket listeners, framing codecs, and message handlers are **planned** and reserved for their respective feature owners (`M1`–`M5`).
+- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`) and the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`) are **implemented and tested** in `shared`. Active socket listeners and operation handlers remain planned for their respective feature owners (`M1`–`M5`).
 
 ---
 
@@ -54,6 +54,9 @@ Every stream control message consists of:
 - Valid frame payload lengths satisfy `1 <= L <= 16,384` bytes (`ProtocolConstants.MAX_FRAME_PAYLOAD_BYTES`).
 - Frames with `L <= 0` or `L > 16,384` must be rejected immediately before allocating payload memory or dispatching.
 - Readers must loop (blocking TCP) or accumulate per-channel `ByteBuffer` state (NIO) until all `4 + L` bytes have arrived, preserving trailing bytes across reads when multiple frames arrive in a single socket read.
+- **Shared implementation (`lk.studylink.shared.protocol.FrameCodec`):**
+  - **Blocking streams (`M1`, `M3` metadata, `M4` TLS):** `FrameCodec.writeFrame(OutputStream, JsonObject)` preserves explicit JSON `null` properties (`JsonNull`), rejects non-finite numeric values (`NaN`, `+Infinity`, `-Infinity`), and validates that the serialized UTF-8 byte count is in `1..16,384` before writing any byte to the stream. `FrameCodec.readFrame(InputStream)` reads raw bytes without a lookahead buffer (leaving subsequent frames or `M3` raw file bytes untouched), returns `null` on a clean EOF at a frame boundary (`0` prefix bytes available), throws `EOFException` on a truncated prefix or payload, and throws `FrameFormatException` on out-of-range lengths, invalid UTF-8, malformed JSON, trailing non-whitespace tokens, or non-object JSON roots.
+  - **Non-blocking NIO reuse (`M5`):** `M5` owns `Selector` registrations, per-channel `ByteBuffer` accumulation, and partial socket writes, and reuses `FrameCodec.encodeFrameBytes(JsonObject)` for outbound write queues plus `FrameCodec.validatePayloadLength(int)` / `FrameCodec.decodeLengthPrefix(byte[], int)` and `FrameCodec.decodePayloadBytes(byte[], int, int)` once a complete `4 + L` frame has accumulated in a channel buffer.
 
 ### 3.2 Consistent `JOIN` Exchange Example (SRS Section 6.3)
 
