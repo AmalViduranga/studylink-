@@ -2,7 +2,7 @@
 
 - **Baseline reference:** [StudyLink Project Report and SRS](../report/StudyLink_Project_Report_and_SRS.pdf) (Sections 3, 5, and 6.3–6.4)
 - **Protocol version:** `v = 1`
-- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`) and the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`) are **implemented and tested** in `shared`. Active socket listeners and operation handlers remain planned for their respective feature owners (`M1`–`M5`).
+- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`), the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`), the shared membership contracts (`lk.studylink.shared.model.RoomBinding`, `SessionInfo`, `MembershipView`, `BindingInvalidationListener`), and the server's in-memory session and room membership registry (`lk.studylink.server.rooms.RoomSessionRegistry`, `DisplayNamePolicy`, `RoomRegistryErrorCode`, `RoomRegistryException`) are **implemented and tested**. Active TCP/UDP/NIO/TLS socket listeners and operation dispatch handlers remain planned for their respective feature issues.
 
 ---
 
@@ -58,16 +58,28 @@ Every stream control message consists of:
   - **Blocking streams (`M1`, `M3` metadata, `M4` TLS):** `FrameCodec.writeFrame(OutputStream, JsonObject)` preserves explicit JSON `null` properties (`JsonNull`), rejects non-finite numeric values (`NaN`, `+Infinity`, `-Infinity`), and validates that the serialized UTF-8 byte count is in `1..16,384` before writing any byte to the stream. `FrameCodec.readFrame(InputStream)` reads raw bytes without a lookahead buffer (leaving subsequent frames or `M3` raw file bytes untouched), returns `null` on a clean EOF at a frame boundary (`0` prefix bytes available), throws `EOFException` on a truncated prefix or payload, and throws `FrameFormatException` on out-of-range lengths, invalid UTF-8, malformed JSON, trailing non-whitespace tokens, or non-object JSON roots.
   - **Non-blocking NIO reuse (`M5`):** `M5` owns `Selector` registrations, per-channel `ByteBuffer` accumulation, and partial socket writes, and reuses `FrameCodec.encodeFrameBytes(JsonObject)` for outbound write queues plus `FrameCodec.validatePayloadLength(int)` / `FrameCodec.decodeLengthPrefix(byte[], int)` and `FrameCodec.decodePayloadBytes(byte[], int, int)` once a complete `4 + L` frame has accumulated in a channel buffer.
 
-### 3.2 Consistent `JOIN` Exchange Example (SRS Section 6.3)
+### 3.2 `HELLO` and `JOIN` Interface Examples and Membership Handoff (SRS Sections 5.1 & 6.3)
 
-After connecting on TCP port `45401` and completing `HELLO` (which registers the student's display name and returns `sessionId` plus the server's active service ports), the client requests to join a room:
+> **Interface Examples Notice:** The `HELLO` and `JOIN` JSON envelopes below document the wire contract connecting client session/room state (`SessionInfo`, `RoomBinding`) to `RoomSessionRegistry`. The blocking TCP socket listener and operation dispatcher for port `45401` are planned for the next `M1` issue (`M1-03`).
 
-**Request (`Client -> Server` on TCP `45401`):**
+**`HELLO` Request (`Client -> Server` on TCP `45401`, interface example):**
+```json
+{"v":1,"id":"r01","op":"HELLO","data":{"displayName":"Amal"}}
+```
+
+**`HELLO` Success Response (`Server -> Client` on TCP `45401`, interface example):**
+```json
+{"v":1,"id":"r01","ok":true,"data":{"sessionId":"s-demo","displayName":"Amal","ports":{"discoveryUdp":45400,"roomsTcp":45401,"chatNioTcp":45402,"filesTcp":45403,"notesTlsTcp":45404}}}
+```
+
+After connecting on TCP port `45401` and completing `HELLO` (which registers the student's display name in `RoomSessionRegistry.registerSession(...)` and returns `sessionId` plus the server's active service ports), the client requests to join a room:
+
+**`JOIN` Request (`Client -> Server` on TCP `45401`):**
 ```json
 {"v":1,"id":"r17","op":"JOIN","data":{"roomId":"netprog"}}
 ```
 
-**Success Response (`Server -> Client` on TCP `45401`):**
+**`JOIN` Success Response (`Server -> Client` on TCP `45401`):**
 ```json
 {"v":1,"id":"r17","ok":true,"data":{"sessionId":"s-demo","roomId":"netprog","revision":2}}
 ```
@@ -79,7 +91,7 @@ When an operation fails validation, the server echoes the request `"id"` with `"
 ```
 
 Standard error codes across features (SRS Sections 5 & 6.3–6.4):
-- `NAME_IN_USE` — Display name is already taken by an active session (case-insensitive comparison).
+- `NAME_IN_USE` — Display name is already taken by an active session (locale-independent code-point case-insensitive comparison via `Character.toLowerCase(Character.toUpperCase(cp))`, matching `String.equalsIgnoreCase`).
 - `INVALID_NAME` — Display name is empty or outside `2–24` letters/digits/spaces (`<= 48` UTF-8 bytes after trim).
 - `UNKNOWN_ROOM` — `roomId` is not one of the configured rooms (`netprog`, `revision`, `workshop`).
 - `STALE_BINDING` — `(sessionId, roomId, revision)` is no longer the current active binding for that session.
@@ -88,6 +100,43 @@ Standard error codes across features (SRS Sections 5 & 6.3–6.4):
 - `ROOM_FILE_LIMIT` — Room already holds the maximum `25` completed files.
 - `BUSY` — File transfer worker pool (`4` active workers + `8` queued tasks) is full.
 - `INBOX_FULL` — Host private-note inbox for the room has reached `100` notes.
+
+#### Consumer API Handoff (`MembershipView` & `RoomSessionRegistry`)
+
+- **Shared models (`lk.studylink.shared.model`):**
+  - `SessionInfo(String sessionId, String displayName)`
+  - `RoomBinding(String sessionId, String roomId, long revision)`
+  - `MembershipView` (`isCurrent`, `executeIfCurrent`, `runIfCurrent`, `addInvalidationListener`, `removeInvalidationListener`)
+  - `BindingInvalidationListener` (`void onBindingInvalidated(RoomBinding invalidatedBinding)`)
+- **Server registry (`lk.studylink.server.rooms.RoomSessionRegistry implements MembershipView`):**
+  - `listRooms()`, `registerSession(String)`, `joinRoom(String, String)`, `leaveRoom(String)`, `closeSession(String)`, `findSession(String)`, `currentBinding(String)`, `listRoomMembers(String)`
+
+**Consumer Usage Examples:**
+- **`M2` (UDP Presence) & `M4` (TLS Private Notes) — Read-only binding check:**
+  ```java
+  if (!membershipView.isCurrent(requestBinding)) {
+      // Reject with STALE_BINDING
+  }
+  ```
+- **`M3` (Concurrent File Transfers) — Atomic final publication guard:**
+  ```java
+  // 1. Check membership before streaming; stream bytes to temp staging file & verify SHA-256 outside the guard.
+  // 2. Atomically re-verify binding and publish the verified bundle under the membership-change guard:
+  Optional<String> committedFileId = membershipView.executeIfCurrent(uploadBinding, () ->
+          roomCatalogue.commitVerifiedBundle(uploadBinding.roomId(), stagedBundlePath, sha256Hex)
+  );
+  if (committedFileId.isEmpty()) {
+      Files.deleteIfExists(stagedBundlePath); // Stale binding: discard staged file
+  }
+  ```
+- **`M5` (Java NIO Live Chat) — Lock-free exact old-binding invalidation notification:**
+  ```java
+  // Registered once at startup; invoked outside the registry lock after state change is committed:
+  membershipView.addInvalidationListener(invalidatedBinding -> {
+      pendingInvalidations.add(invalidatedBinding);
+      selector.wakeup(); // Selector thread removes only the subscription matching invalidatedBinding (including revision)
+  });
+  ```
 
 ### 3.3 UDP Datagrams (Port `45400` — M2 Discovery & Presence)
 
