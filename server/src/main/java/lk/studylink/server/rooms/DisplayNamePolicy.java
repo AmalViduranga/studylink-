@@ -1,7 +1,6 @@
 package lk.studylink.server.rooms;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -11,7 +10,9 @@ import java.util.Objects;
  *   <li>Require {@code 2..24} Unicode code points.</li>
  *   <li>Require at most {@code 48} UTF-8 bytes.</li>
  *   <li>Allow only Unicode letters, Unicode digits, and the ASCII space character ({@code ' '}).</li>
- *   <li>Compare active names case-insensitively using {@link Locale#ROOT}.</li>
+ *   <li>Compare active names case-insensitively and locale-independently by folding each Unicode
+ *       code point {@code cp} via {@code Character.toLowerCase(Character.toUpperCase(cp))},
+ *       matching Java's {@link String#equalsIgnoreCase(String)} equivalence class.</li>
  * </ul>
  */
 public final class DisplayNamePolicy {
@@ -85,13 +86,26 @@ public final class DisplayNamePolicy {
     }
 
     /**
-     * Produces a locale-independent, case-folded canonical key for active display name uniqueness checks.
+     * Produces a locale-independent, case-folded canonical key for active display name uniqueness
+     * checks, lookup, and release.
+     *
+     * <p>Each Unicode code point {@code cp} is folded via
+     * {@code Character.toLowerCase(Character.toUpperCase(cp))}. This uses Unicode 1-to-1 simple
+     * case folding (consistent with {@link String#equalsIgnoreCase(String)}) without locale
+     * dependence or 1-to-many expansion discrepancies (such as {@code "Straße"} vs {@code "STRAẞE"}).
      *
      * @param trimmedDisplayName validated, trimmed display name
-     * @return canonical key folded with {@link Locale#ROOT}
+     * @return canonical case-folded key
      */
     public static String canonicalKey(String trimmedDisplayName) {
         Objects.requireNonNull(trimmedDisplayName, "trimmedDisplayName must not be null");
-        return trimmedDisplayName.toUpperCase(Locale.ROOT).toLowerCase(Locale.ROOT);
+        StringBuilder key = new StringBuilder(trimmedDisplayName.length());
+        for (int offset = 0; offset < trimmedDisplayName.length(); ) {
+            int cp = trimmedDisplayName.codePointAt(offset);
+            int folded = Character.toLowerCase(Character.toUpperCase(cp));
+            key.appendCodePoint(folded);
+            offset += Character.charCount(cp);
+        }
+        return key.toString();
     }
 }

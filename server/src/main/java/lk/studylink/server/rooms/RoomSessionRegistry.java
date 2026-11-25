@@ -39,10 +39,15 @@ import lk.studylink.shared.model.SessionInfo;
  *       against concurrent room switches, leaves, or session closures.</li>
  *   <li><strong>M5 lock-free invalidation notifications:</strong> State mutations are committed under
  *       the lock before the lock is released; registered {@link BindingInvalidationListener}s are then
- *       invoked <em>outside</em> the registry lock with the exact invalidated {@link RoomBinding}.</li>
+ *       invoked <em>outside</em> the registry lock with the exact invalidated {@link RoomBinding}.
+ *       If a listener throws a {@link RuntimeException}, the failure is logged via
+ *       {@link System.Logger} and remaining listeners still execute while the caller receives the
+ *       committed result. JVM {@link Error}s are not swallowed.</li>
  * </ul>
  */
 public final class RoomSessionRegistry implements MembershipView {
+
+    private static final System.Logger LOGGER = System.getLogger(RoomSessionRegistry.class.getName());
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<String, RoomDefinition> configuredRoomsById;
@@ -394,7 +399,15 @@ public final class RoomSessionRegistry implements MembershipView {
     private void notifyInvalidatedOutsideLock(RoomBinding invalidatedBinding) {
         assert !lock.isHeldByCurrentThread() : "Listeners must never be called under the registry lock";
         for (BindingInvalidationListener listener : invalidationListeners) {
-            listener.onBindingInvalidated(invalidatedBinding);
+            try {
+                listener.onBindingInvalidated(invalidatedBinding);
+            } catch (RuntimeException e) {
+                LOGGER.log(
+                        System.Logger.Level.WARNING,
+                        () -> "BindingInvalidationListener failed for " + invalidatedBinding + ": " + e.getMessage(),
+                        e
+                );
+            }
         }
     }
 

@@ -91,7 +91,7 @@ When an operation fails validation, the server echoes the request `"id"` with `"
 ```
 
 Standard error codes across features (SRS Sections 5 & 6.3–6.4):
-- `NAME_IN_USE` — Display name is already taken by an active session (case-insensitive comparison).
+- `NAME_IN_USE` — Display name is already taken by an active session (locale-independent code-point case-insensitive comparison via `Character.toLowerCase(Character.toUpperCase(cp))`, matching `String.equalsIgnoreCase`).
 - `INVALID_NAME` — Display name is empty or outside `2–24` letters/digits/spaces (`<= 48` UTF-8 bytes after trim).
 - `UNKNOWN_ROOM` — `roomId` is not one of the configured rooms (`netprog`, `revision`, `workshop`).
 - `STALE_BINDING` — `(sessionId, roomId, revision)` is no longer the current active binding for that session.

@@ -464,4 +464,130 @@ class RoomSessionRegistryTest {
         registry.closeSession(other.sessionId());
         assertEquals(3, observedInvalidations.size());
     }
+
+    @Test
+    void throwingInvalidationListenerDoesNotAbortSwitchLeaveOrCloseAndHealthyListenerReceivesOldBindings()
+            throws RoomRegistryException {
+        RoomSessionRegistry registry = new RoomSessionRegistry(StudyLinkConfig.srsDefaults());
+        AtomicInteger throwingCalls = new AtomicInteger();
+        List<RoomBinding> healthyReceived = new ArrayList<>();
+        AtomicBoolean heldLockInListener = new AtomicBoolean(false);
+
+        registry.addInvalidationListener(invalidated -> {
+            if (registry.isLockHeldByCurrentThread()) {
+                heldLockInListener.set(true);
+            }
+            throwingCalls.incrementAndGet();
+            throw new IllegalStateException("Simulated listener failure for " + invalidated);
+        });
+
+        registry.addInvalidationListener(invalidated -> {
+            if (registry.isLockHeldByCurrentThread()) {
+                heldLockInListener.set(true);
+            }
+            assertFalse(registry.isCurrent(invalidated),
+                    "Invalidated binding must already be non-current when healthy listener runs");
+            healthyReceived.add(invalidated);
+        });
+
+        SessionInfo session = registry.registerSession("Amal");
+        RoomBinding rev1 = registry.joinRoom(session.sessionId(), "netprog");
+        assertTrue(healthyReceived.isEmpty());
+
+        // 1. Switch netprog (rev 1) -> revision (rev 2)
+        RoomBinding rev2 = registry.joinRoom(session.sessionId(), "revision");
+        assertEquals(new RoomBinding(session.sessionId(), "revision", 2L), rev2);
+        assertFalse(registry.isCurrent(rev1));
+        assertTrue(registry.isCurrent(rev2));
+        assertEquals(Optional.of(rev2), registry.currentBinding(session.sessionId()));
+        assertEquals(1, throwingCalls.get());
+        assertEquals(List.of(rev1), healthyReceived);
+
+        // 2. Leave revision (rev 2)
+        Optional<RoomBinding> left = registry.leaveRoom(session.sessionId());
+        assertEquals(Optional.of(rev2), left);
+        assertFalse(registry.isCurrent(rev2));
+        assertEquals(Optional.empty(), registry.currentBinding(session.sessionId()));
+        assertTrue(registry.findSession(session.sessionId()).isPresent());
+        assertEquals(2, throwingCalls.get());
+        assertEquals(List.of(rev1, rev2), healthyReceived);
+
+        // 3. Join workshop (rev 3) and close session
+        RoomBinding rev3 = registry.joinRoom(session.sessionId(), "workshop");
+        assertTrue(registry.closeSession(session.sessionId()));
+        assertFalse(registry.isCurrent(rev3));
+        assertEquals(Optional.empty(), registry.findSession(session.sessionId()));
+        assertEquals(3, throwingCalls.get());
+        assertEquals(List.of(rev1, rev2, rev3), healthyReceived);
+        assertFalse(heldLockInListener.get(), "Listeners must never be called under the registry lock");
+
+        // Closing the session must still have released the display name "Amal"
+        SessionInfo reconnected = registry.registerSession("Amal");
+        assertNotEquals(session.sessionId(), reconnected.sessionId());
+    }
+
+    @Test
+    void doesNotSwallowJvmErrorsFromInvalidationListener() throws RoomRegistryException {
+        final class SimulatedJvmError extends Error {
+            private SimulatedJvmError() {
+                super("simulated JVM error");
+            }
+        }
+
+        RoomSessionRegistry registry = new RoomSessionRegistry(StudyLinkConfig.srsDefaults());
+        registry.addInvalidationListener(invalidated -> {
+            throw new SimulatedJvmError();
+        });
+
+        SessionInfo session = registry.registerSession("Amal");
+        RoomBinding rev1 = registry.joinRoom(session.sessionId(), "netprog");
+
+        assertThrows(SimulatedJvmError.class, () -> registry.joinRoom(session.sessionId(), "revision"));
+        assertFalse(registry.isCurrent(rev1));
+        assertTrue(registry.isCurrent(new RoomBinding(session.sessionId(), "revision", 2L)));
+    }
+
+    @Test
+    void rejectsUnicodeCaseFoldEquivalentDisplayNamesInBothOrdersAndSupportsReleaseAndLateCleanup()
+            throws RoomRegistryException {
+        assertTrue("Straße".equalsIgnoreCase("STRAẞE"));
+        RoomSessionRegistry registry = new RoomSessionRegistry(StudyLinkConfig.srsDefaults());
+
+        // 1. Register "Straße", then reject "STRAẞE"
+        SessionInfo first = registry.registerSession("Straße");
+        assertEquals("Straße", first.displayName());
+
+        RoomRegistryException firstDup = assertThrows(
+                RoomRegistryException.class,
+                () -> registry.registerSession("STRAẞE")
+        );
+        assertEquals(RoomRegistryErrorCode.NAME_IN_USE, firstDup.errorCode());
+
+        // 2. Close "Straße", then register "STRAẞE" and reject "Straße"
+        assertTrue(registry.closeSession(first.sessionId()));
+
+        SessionInfo second = registry.registerSession("STRAẞE");
+        assertEquals("STRAẞE", second.displayName());
+        assertNotEquals(first.sessionId(), second.sessionId());
+
+        RoomRegistryException secondDup = assertThrows(
+                RoomRegistryException.class,
+                () -> registry.registerSession("Straße")
+        );
+        assertEquals(RoomRegistryErrorCode.NAME_IN_USE, secondDup.errorCode());
+
+        // 3. Late cleanup of old session 'first' must not release 'second'
+        assertFalse(registry.closeSession(first.sessionId()));
+        assertTrue(registry.findSession(second.sessionId()).isPresent());
+        RoomRegistryException stillReserved = assertThrows(
+                RoomRegistryException.class,
+                () -> registry.registerSession("Straße")
+        );
+        assertEquals(RoomRegistryErrorCode.NAME_IN_USE, stillReserved.errorCode());
+
+        // 4. Closing 'second' releases the name for future re-registration
+        assertTrue(registry.closeSession(second.sessionId()));
+        SessionInfo third = registry.registerSession("Straße");
+        assertEquals("Straße", third.displayName());
+    }
 }
