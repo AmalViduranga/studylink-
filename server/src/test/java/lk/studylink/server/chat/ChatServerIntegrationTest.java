@@ -433,10 +433,10 @@ class ChatServerIntegrationTest {
 
                 assertEquals(3, server.activeConnectionCount());
 
-                // Flood ~1.8 KiB messages; OS TCP receive window fills and server outbound queue exceeds 65,536 B
+                // Flood ~1.8 KiB messages; OS TCP receive/send buffers fill and server outbound queue exceeds 65,536 B
                 String largePayload = "M".repeat(1_800);
                 int sent = 0;
-                int maxMessages = 600;
+                int maxMessages = 1_500;
                 while (sent < maxMessages && server.activeConnectionCount() == 3) {
                     JsonObject ack = senderPeer.sendChat("flood-" + sent, largePayload);
                     assertTrue(ack.get("ok").getAsBoolean());

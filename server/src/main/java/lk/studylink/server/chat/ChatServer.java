@@ -369,8 +369,9 @@ public final class ChatServer implements AutoCloseable {
                 clientChannel.configureBlocking(false);
                 try {
                     clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, true);
+                    clientChannel.setOption(StandardSocketOptions.SO_SNDBUF, 32_768);
                 } catch (IOException ignored) {
-                    // Best-effort low-latency option
+                    // Best-effort low-latency and bounded kernel send-buffer options
                 }
                 SelectionKey clientKey = clientChannel.register(sel, SelectionKey.OP_READ);
                 ChatClientState state = new ChatClientState(clientChannel, clientKey, config.maxFrameBytes());
