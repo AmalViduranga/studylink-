@@ -9,6 +9,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -18,6 +19,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -73,14 +75,18 @@ public final class RoomControlServer implements AutoCloseable {
 
     private static final System.Logger LOGGER = System.getLogger(RoomControlServer.class.getName());
     private static final int SHUTDOWN_WAIT_MILLIS = 3_000;
+    private static final BigDecimal EXPECTED_PROTOCOL_VERSION =
+            BigDecimal.valueOf(ProtocolConstants.PROTOCOL_VERSION);
 
     private final String bindHost;
     private final int requestedPort;
     private final StudyLinkConfig config;
     private final RoomSessionRegistry registry;
 
+    private final ReentrantLock stateLock = new ReentrantLock();
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final CountDownLatch shutdownComplete = new CountDownLatch(1);
     private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
     private final Set<String> activeSessionIds = ConcurrentHashMap.newKeySet();
     private final ReentrantLock cleanupMonitor = new ReentrantLock();
@@ -90,6 +96,7 @@ public final class RoomControlServer implements AutoCloseable {
     private volatile InetSocketAddress boundAddress;
     private volatile Thread acceptorThread;
     private volatile ExecutorService clientExecutor;
+    private volatile Runnable afterSocketBoundTestHook;
 
     /**
      * Creates a room-control server configured to bind {@code config.serverHost()} and
@@ -138,44 +145,63 @@ public final class RoomControlServer implements AutoCloseable {
     /**
      * Binds the TCP {@link ServerSocket} and starts the non-blocking accept loop thread.
      *
+     * <p>Coordinates with {@link #close()} via {@code stateLock} so an in-progress {@code start()}
+     * and a concurrent {@code close()} are serialized: either {@code close()} runs first and
+     * {@code start()} throws {@link IllegalStateException} without binding a socket, or
+     * {@code start()} finishes publishing its listener under {@code stateLock} and {@code close()}
+     * immediately closes that listener before returning.
+     *
      * @throws IOException           if binding the socket fails
      * @throws IllegalStateException if the server was already started or already closed
      */
-    public synchronized void start() throws IOException {
-        if (closed.get()) {
-            throw new IllegalStateException("RoomControlServer has already been closed");
-        }
-        if (!started.compareAndSet(false, true)) {
-            throw new IllegalStateException("RoomControlServer is already started");
-        }
-
-        ServerSocket socket = new ServerSocket();
+    public void start() throws IOException {
+        stateLock.lock();
         try {
-            socket.setReuseAddress(true);
-            InetAddress address = InetAddress.getByName(bindHost);
-            socket.bind(new InetSocketAddress(address, requestedPort));
-        } catch (IOException e) {
-            started.set(false);
-            closeQuietly(socket);
-            throw e;
+            if (closed.get()) {
+                throw new IllegalStateException("RoomControlServer has already been closed");
+            }
+            if (started.get()) {
+                throw new IllegalStateException("RoomControlServer is already started");
+            }
+
+            ServerSocket socket = new ServerSocket();
+            try {
+                socket.setReuseAddress(true);
+                InetAddress address = InetAddress.getByName(bindHost);
+                socket.bind(new InetSocketAddress(address, requestedPort));
+            } catch (IOException e) {
+                closeQuietly(socket);
+                throw e;
+            }
+
+            this.serverSocket = socket;
+            this.boundAddress = (InetSocketAddress) socket.getLocalSocketAddress();
+            int actualPort = socket.getLocalPort();
+
+            Runnable hook = this.afterSocketBoundTestHook;
+            if (hook != null) {
+                hook.run();
+            }
+
+            AtomicInteger workerCounter = new AtomicInteger(1);
+            ThreadFactory workerFactory = runnable -> {
+                Thread t = new Thread(
+                        runnable,
+                        "studylink-rooms-worker-" + actualPort + "-" + workerCounter.getAndIncrement()
+                );
+                t.setDaemon(true);
+                return t;
+            };
+            this.clientExecutor = Executors.newCachedThreadPool(workerFactory);
+
+            Thread acceptor = new Thread(this::acceptLoop, "studylink-rooms-acceptor-" + actualPort);
+            acceptor.setDaemon(true);
+            this.acceptorThread = acceptor;
+            this.started.set(true);
+            acceptor.start();
+        } finally {
+            stateLock.unlock();
         }
-
-        this.serverSocket = socket;
-        this.boundAddress = (InetSocketAddress) socket.getLocalSocketAddress();
-        int actualPort = socket.getLocalPort();
-
-        AtomicInteger workerCounter = new AtomicInteger(1);
-        ThreadFactory workerFactory = runnable -> {
-            Thread t = new Thread(runnable, "studylink-rooms-worker-" + actualPort + "-" + workerCounter.getAndIncrement());
-            t.setDaemon(true);
-            return t;
-        };
-        this.clientExecutor = Executors.newCachedThreadPool(workerFactory);
-
-        Thread acceptor = new Thread(this::acceptLoop, "studylink-rooms-acceptor-" + actualPort);
-        acceptor.setDaemon(true);
-        this.acceptorThread = acceptor;
-        acceptor.start();
     }
 
     /**
@@ -262,41 +288,78 @@ public final class RoomControlServer implements AutoCloseable {
      */
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
+        final boolean isFirstCloser;
+        final ServerSocket listenerToClose;
+        final ExecutorService executorToShutdown;
+        final Thread acceptorToJoin;
+
+        stateLock.lock();
+        try {
+            isFirstCloser = closed.compareAndSet(false, true);
+            listenerToClose = this.serverSocket;
+            executorToShutdown = this.clientExecutor;
+            acceptorToJoin = this.acceptorThread;
+            closeQuietly(listenerToClose);
+        } finally {
+            stateLock.unlock();
+        }
+
+        if (!isFirstCloser) {
+            try {
+                shutdownComplete.await(SHUTDOWN_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             return;
         }
 
-        closeQuietly(serverSocket);
-
-        for (Socket clientSocket : activeSockets) {
-            closeQuietly(clientSocket);
-        }
-        activeSockets.clear();
-
-        for (String sessionId : activeSessionIds) {
-            registry.closeSession(sessionId);
-        }
-        activeSessionIds.clear();
-        signalCleanupMonitor();
-
-        ExecutorService executor = this.clientExecutor;
-        if (executor != null) {
-            executor.shutdownNow();
-            try {
-                executor.awaitTermination(SHUTDOWN_WAIT_MILLIS, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        try {
+            for (Socket clientSocket : activeSockets) {
+                closeQuietly(clientSocket);
             }
-        }
+            activeSockets.clear();
 
-        Thread acceptor = this.acceptorThread;
-        if (acceptor != null && acceptor != Thread.currentThread()) {
-            try {
-                acceptor.join(SHUTDOWN_WAIT_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            for (String sessionId : activeSessionIds) {
+                registry.closeSession(sessionId);
             }
+            activeSessionIds.clear();
+            signalCleanupMonitor();
+
+            if (executorToShutdown != null) {
+                executorToShutdown.shutdownNow();
+                try {
+                    executorToShutdown.awaitTermination(SHUTDOWN_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            if (acceptorToJoin != null && acceptorToJoin != Thread.currentThread()) {
+                try {
+                    acceptorToJoin.join(SHUTDOWN_WAIT_MILLIS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } finally {
+            shutdownComplete.countDown();
         }
+    }
+
+    /**
+     * Package-private lifecycle test hook invoked inside {@link #start()} after the
+     * {@link ServerSocket} is bound and while {@code stateLock} is still held.
+     */
+    void setAfterSocketBoundTestHook(Runnable hook) {
+        this.afterSocketBoundTestHook = hook;
+    }
+
+    /**
+     * Package-private inspection helper for tests verifying that a concurrent {@link #close()}
+     * is queued on {@code stateLock} while {@link #start()} is in progress.
+     */
+    boolean hasQueuedLifecycleThreads() {
+        return stateLock.hasQueuedThreads();
     }
 
     private void acceptLoop() {
@@ -707,8 +770,7 @@ public final class RoomControlServer implements AutoCloseable {
             return false;
         }
         try {
-            return prim.getAsInt() == ProtocolConstants.PROTOCOL_VERSION
-                    && prim.getAsDouble() == ProtocolConstants.PROTOCOL_VERSION;
+            return prim.getAsBigDecimal().compareTo(EXPECTED_PROTOCOL_VERSION) == 0;
         } catch (NumberFormatException e) {
             return false;
         }
@@ -716,11 +778,10 @@ public final class RoomControlServer implements AutoCloseable {
 
     private static String extractValidRequestId(JsonObject request) {
         String id = extractStrictStringField(request, "id");
-        if (id == null) {
+        if (id == null || id.isBlank()) {
             return null;
         }
-        String trimmed = id.trim();
-        return trimmed.isEmpty() ? null : trimmed;
+        return id;
     }
 
     private static String extractOptionalStringField(JsonObject obj, String key) {

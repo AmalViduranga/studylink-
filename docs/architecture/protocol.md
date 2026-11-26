@@ -60,7 +60,7 @@ Every stream control message consists of:
 
 ### 3.2 TCP Room-Control Operations (`45401` — `RoomControlServer`) and Membership Handoff (SRS Sections 5.1 & 6.3)
 
-`lk.studylink.server.rooms.RoomControlServer` serves the six blocking TCP control operations below using `FrameCodec`. Each TCP connection owns at most one registered session bound during `HELLO`. All post-`HELLO` operations execute strictly against the connection's own bound `sessionId`; any request supplying a mismatched `sessionId` is rejected with `STALE_BINDING` without modifying another client's session. If a frame is unreadable/truncated or lacks a non-blank string `"id"`, the server closes that connection and releases its bound session in `finally`.
+`lk.studylink.server.rooms.RoomControlServer` serves the six blocking TCP control operations below using `FrameCodec`. Each request must carry `"v": 1` (exact numeric value `1`, compared without floating-point precision loss so `1` and `1.0` are accepted while `1.0000000000000001` or `"1"` is rejected with `UNSUPPORTED_VERSION`) and a non-blank string `"id"` (echoed verbatim without trimming in both success and error responses). Each TCP connection owns at most one registered session bound during `HELLO`. All post-`HELLO` operations execute strictly against the connection's own bound `sessionId`; any request supplying a mismatched `sessionId` is rejected with `STALE_BINDING` without modifying another client's session. If a frame is unreadable/truncated or lacks a non-blank string `"id"`, the server closes that connection and releases its bound session in `finally`.
 
 #### 1. `HELLO` (Register Display Name & Bind Connection Session)
 **Request (`Client -> Server`):**

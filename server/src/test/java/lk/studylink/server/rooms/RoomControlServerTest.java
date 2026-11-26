@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonArray;
@@ -12,12 +13,20 @@ import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
@@ -472,6 +481,227 @@ class RoomControlServerTest {
         }
     }
 
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void preservesUntrimmedNonBlankRequestIdsAndClosesOnBlankOnlyRequestId() throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults();
+        RoomSessionRegistry registry = new RoomSessionRegistry(config);
+
+        try (RoomControlServer server = new RoomControlServer("127.0.0.1", 0, config, registry)) {
+            server.start();
+
+            try (TestControlClient client = TestControlClient.connect(server.boundPort())) {
+                // 1. Successful request with surrounding spaces in request ID (" r17 ")
+                JsonObject helloData = new JsonObject();
+                helloData.addProperty("displayName", "Amal");
+                JsonObject helloResp = client.request(" r17 ", RoomControlServer.OP_HELLO, helloData);
+                assertTrue(helloResp.get("ok").getAsBoolean());
+                assertEquals(" r17 ", helloResp.get("id").getAsString(),
+                        "Server must echo untrimmed request ID exactly on success");
+                String sessionId = helloResp.getAsJsonObject("data").get("sessionId").getAsString();
+
+                // 2. Correlated error response with surrounding spaces in request ID (" r17 ")
+                JsonObject badJoinData = new JsonObject();
+                badJoinData.addProperty("roomId", "unknown-room");
+                JsonObject errorResp = client.request(" r17 ", RoomControlServer.OP_JOIN, badJoinData);
+                assertFalse(errorResp.get("ok").getAsBoolean());
+                assertEquals(" r17 ", errorResp.get("id").getAsString(),
+                        "Server must echo untrimmed request ID exactly on correlated error");
+                assertEquals(
+                        RoomRegistryErrorCode.UNKNOWN_ROOM.name(),
+                        errorResp.getAsJsonObject("error").get("code").getAsString()
+                );
+
+                // 3. Blank-only request ID ("   ") must close the connection predictably
+                JsonObject blankIdReq = new JsonObject();
+                blankIdReq.addProperty("v", 1);
+                blankIdReq.addProperty("id", "   ");
+                blankIdReq.addProperty("op", RoomControlServer.OP_PING);
+                blankIdReq.add("data", new JsonObject());
+                FrameCodec.writeFrame(client.out, blankIdReq);
+
+                assertNull(FrameCodec.readFrame(client.in),
+                        "Blank-only request ID must close the connection without a response frame");
+                assertTrue(server.awaitSessionClosed(sessionId, 3, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void comparesProtocolVersionWithExactPrecisionAndRejectsImpreciseDecimalsAndStrings() throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults();
+        RoomSessionRegistry registry = new RoomSessionRegistry(config);
+
+        try (RoomControlServer server = new RoomControlServer("127.0.0.1", 0, config, registry)) {
+            server.start();
+
+            try (TestControlClient client = TestControlClient.connect(server.boundPort())) {
+                JsonObject helloData = new JsonObject();
+                helloData.addProperty("displayName", "Amal");
+                JsonObject helloResp = client.request("r-hello", RoomControlServer.OP_HELLO, helloData);
+                assertTrue(helloResp.get("ok").getAsBoolean());
+
+                // 1. Exact decimal literal 1.0000000000000001 must be rejected with UNSUPPORTED_VERSION
+                String impreciseJson = "{\"v\":1.0000000000000001,\"id\":\" r-imprecise \",\"op\":\"PING\",\"data\":{}}";
+                assertTrue(impreciseJson.contains("1.0000000000000001"));
+                JsonObject impreciseResp = client.rawJsonRequest(impreciseJson);
+                assertFalse(impreciseResp.get("ok").getAsBoolean());
+                assertEquals(" r-imprecise ", impreciseResp.get("id").getAsString());
+                assertEquals(
+                        RoomControlServer.ERR_UNSUPPORTED_VERSION,
+                        impreciseResp.getAsJsonObject("error").get("code").getAsString()
+                );
+
+                // 2. Numerically equal forms 1 and 1.0 must succeed
+                JsonObject onePointZeroResp = client.rawJsonRequest(
+                        "{\"v\":1.0,\"id\":\"r-1.0\",\"op\":\"PING\",\"data\":{}}"
+                );
+                assertTrue(onePointZeroResp.get("ok").getAsBoolean());
+                assertEquals("r-1.0", onePointZeroResp.get("id").getAsString());
+                assertTrue(onePointZeroResp.getAsJsonObject("data").get("pong").getAsBoolean());
+
+                // 3. String "1" must be rejected with UNSUPPORTED_VERSION
+                JsonObject stringVersionResp = client.rawJsonRequest(
+                        "{\"v\":\"1\",\"id\":\"r-str-1\",\"op\":\"PING\",\"data\":{}}"
+                );
+                assertFalse(stringVersionResp.get("ok").getAsBoolean());
+                assertEquals("r-str-1", stringVersionResp.get("id").getAsString());
+                assertEquals(
+                        RoomControlServer.ERR_UNSUPPORTED_VERSION,
+                        stringVersionResp.getAsJsonObject("error").get("code").getAsString()
+                );
+
+                // 4. Following valid PING on the same connection still works
+                JsonObject validPingResp = client.request("r-valid-after", RoomControlServer.OP_PING, new JsonObject());
+                assertTrue(validPingResp.get("ok").getAsBoolean());
+                assertEquals("r-valid-after", validPingResp.get("id").getAsString());
+                assertTrue(validPingResp.getAsJsonObject("data").get("pong").getAsBoolean());
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void coordinatesConcurrentStartAndCloseCloseBeforeStartAndBindFailureCleanup() throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults();
+
+        // 1. close() before start() prevents subsequent start()
+        RoomSessionRegistry reg1 = new RoomSessionRegistry(config);
+        RoomControlServer closedBeforeStart = new RoomControlServer("127.0.0.1", 0, config, reg1);
+        closedBeforeStart.close();
+        closedBeforeStart.close();
+        assertThrows(IllegalStateException.class, closedBeforeStart::start);
+        assertFalse(closedBeforeStart.isRunning());
+
+        // 2. Bind failure cleans up unbound socket and leaves server stopped
+        RoomSessionRegistry reg2 = new RoomSessionRegistry(config);
+        try (RoomControlServer occupant = new RoomControlServer("127.0.0.1", 0, config, reg2)) {
+            occupant.start();
+            int occupiedPort = occupant.boundPort();
+
+            RoomControlServer failingBind = new RoomControlServer("127.0.0.1", occupiedPort, config, reg2);
+            assertThrows(IOException.class, failingBind::start);
+            assertFalse(failingBind.isRunning());
+            failingBind.close();
+            assertFalse(failingBind.isRunning());
+        }
+
+        // 3. Deterministic mid-start close(): close() is invoked after socket.bind() while start()
+        //    is still in progress. close() must wait for start() to finish publishing and then
+        //    close the bound listener before returning.
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            RoomSessionRegistry midStartRegistry = new RoomSessionRegistry(config);
+            RoomControlServer midStartServer = new RoomControlServer("127.0.0.1", 0, config, midStartRegistry);
+            CountDownLatch socketBoundInStart = new CountDownLatch(1);
+            CountDownLatch closeTaskDispatched = new CountDownLatch(1);
+
+            midStartServer.setAfterSocketBoundTestHook(() -> {
+                socketBoundInStart.countDown();
+                try {
+                    assertTrue(closeTaskDispatched.await(3, TimeUnit.SECONDS));
+                    while (!midStartServer.hasQueuedLifecycleThreads()) {
+                        Thread.onSpinWait();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            Future<?> midStartFuture = pool.submit(() -> {
+                midStartServer.start();
+                return null;
+            });
+
+            assertTrue(socketBoundInStart.await(3, TimeUnit.SECONDS));
+            int midStartPort = midStartServer.boundPort();
+            assertTrue(midStartPort > 0);
+
+            Future<?> concurrentCloseFuture = pool.submit(() -> {
+                closeTaskDispatched.countDown();
+                midStartServer.close();
+                return null;
+            });
+
+            midStartFuture.get(5, TimeUnit.SECONDS);
+            concurrentCloseFuture.get(5, TimeUnit.SECONDS);
+
+            assertFalse(midStartServer.isRunning(),
+                    "In-progress start() must not leave an unclosed listener after concurrent close() finishes");
+            try (ServerSocket rebindMidStart = new ServerSocket()) {
+                rebindMidStart.setReuseAddress(true);
+                rebindMidStart.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), midStartPort));
+                assertEquals(midStartPort, rebindMidStart.getLocalPort());
+            }
+
+            // 4. Concurrent start() and close() across coordinated barrier tasks
+            for (int i = 0; i < 12; i++) {
+                RoomSessionRegistry roundRegistry = new RoomSessionRegistry(config);
+                RoomControlServer server = new RoomControlServer("127.0.0.1", 0, config, roundRegistry);
+                CyclicBarrier barrier = new CyclicBarrier(2);
+
+                Future<?> startFuture = pool.submit(() -> {
+                    barrier.await(3, TimeUnit.SECONDS);
+                    try {
+                        server.start();
+                    } catch (IllegalStateException expectedWhenCloseWinsFirst) {
+                        // Expected if close() acquired lifecycle lock before start()
+                    }
+                    return null;
+                });
+
+                Future<?> closeFuture = pool.submit(() -> {
+                    barrier.await(3, TimeUnit.SECONDS);
+                    server.close();
+                    return null;
+                });
+
+                startFuture.get(5, TimeUnit.SECONDS);
+                closeFuture.get(5, TimeUnit.SECONDS);
+
+                assertFalse(server.isRunning(), "Server must be stopped after concurrent start() and close()");
+
+                Integer boundPort = null;
+                try {
+                    boundPort = server.boundPort();
+                } catch (IllegalStateException ignored) {
+                    // close() ran before start() bound a socket
+                }
+
+                if (boundPort != null) {
+                    try (ServerSocket rebindCheck = new ServerSocket()) {
+                        rebindCheck.setReuseAddress(true);
+                        rebindCheck.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), boundPort));
+                        assertEquals(boundPort.intValue(), rebindCheck.getLocalPort());
+                    }
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private static final class TestControlClient implements AutoCloseable {
         private final Socket socket;
         private final InputStream in;
@@ -524,6 +754,18 @@ class RoomControlServerTest {
                 transcript.add("[Server -> " + label + "] "
                         + new String(FrameCodec.encodePayloadBytes(resp), StandardCharsets.UTF_8));
             }
+            return resp;
+        }
+
+        private JsonObject rawJsonRequest(String rawUtf8Json) throws IOException {
+            byte[] payload = rawUtf8Json.getBytes(StandardCharsets.UTF_8);
+            byte[] frame = new byte[4 + payload.length];
+            ByteBuffer.wrap(frame, 0, 4).putInt(payload.length);
+            System.arraycopy(payload, 0, frame, 4, payload.length);
+            out.write(frame);
+            out.flush();
+            JsonObject resp = FrameCodec.readFrame(in);
+            assertNotNull(resp, "Expected response frame for raw request " + rawUtf8Json);
             return resp;
         }
 
