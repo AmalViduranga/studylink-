@@ -2,7 +2,7 @@
 
 - **Baseline reference:** [StudyLink Project Report and SRS](../report/StudyLink_Project_Report_and_SRS.pdf) (Sections 3, 5, and 6.3–6.4)
 - **Protocol version:** `v = 1`
-- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`), the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`), the shared membership contracts (`lk.studylink.shared.model.RoomBinding`, `SessionInfo`, `MembershipView`, `BindingInvalidationListener`), the server's in-memory session and room membership registry (`lk.studylink.server.rooms.RoomSessionRegistry`, `DisplayNamePolicy`, `RoomRegistryErrorCode`, `RoomRegistryException`), and the blocking TCP room-control server (`lk.studylink.server.rooms.RoomControlServer`) are **implemented and tested**. The client room-control connector (`M1-04`), `ServerMain` runtime wiring, and the `M2`–`M5` service listeners remain planned for their respective feature issues.
+- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`), the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`), the shared membership contracts (`lk.studylink.shared.model.RoomBinding`, `SessionInfo`, `MembershipView`, `BindingInvalidationListener`), the server's in-memory session and room membership registry (`lk.studylink.server.rooms.RoomSessionRegistry`, `DisplayNamePolicy`, `RoomRegistryErrorCode`, `RoomRegistryException`), the blocking TCP room-control server with 20-second inactive-session expiry (`lk.studylink.server.rooms.RoomControlServer`), and the blocking TCP room-control client with automatic 5-second `PING` heartbeats (`lk.studylink.client.rooms.RoomClient`, `AdvertisedServicePorts`, `RoomClientException`) are **implemented and tested**. Swing room panels (`M1-05`), `ServerMain` runtime wiring (`M1-06`), and the `M2`–`M5` service listeners remain planned for their respective feature issues.
 
 ---
 
@@ -103,7 +103,7 @@ Every stream control message consists of:
 ```
 *(If the session was already outside all rooms, `"leftRoomId"` is `null`.)*
 
-#### 5. `PING` (Connection Liveness Check)
+#### 5. `PING` (Connection Liveness Check & Inactivity Expiry)
 **Request (`Client -> Server`):**
 ```json
 {"v":1,"id":"r19","op":"PING","data":{}}
@@ -112,6 +112,9 @@ Every stream control message consists of:
 ```json
 {"v":1,"id":"r19","ok":true,"data":{"sessionId":"s-demo","pong":true}}
 ```
+- **Automatic Client Heartbeats (`RoomClient`):** After `HELLO` succeeds, `RoomClient` schedules periodic `PING` frames every `timeouts.controlPingIntervalMs` (`5,000 ms` default), serialized through the connection's request-response lock so heartbeats and user actions (`LIST_ROOMS`, `JOIN`, `LEAVE`, `QUIT`) never interleave or consume each other's responses.
+- **Server-Side Inactivity Expiry (`RoomControlServer`):** After `HELLO` succeeds, `RoomControlServer` tracks the connection on a monotonic clock (`System.nanoTime`) and refreshes the lease only when a complete, valid control frame (`HELLO`, `LIST_ROOMS`, `JOIN`, `LEAVE`, `PING`, `QUIT`) arrives. Partial frame bytes do not renew the lease. If a registered connection remains silent for `timeouts.controlSessionExpiryMs` (`20,000 ms` default, swept every `<= 200 ms`), the server atomically marks it expired, closes its TCP socket, releases its display name, and invalidates its active `RoomBinding`.
+- **Client Endpoint Handoff (`RoomClient` <-> `M2` Discovery):** Until `M2`'s shared `Endpoint` model is added, `RoomClient.connect(InetSocketAddress, String)` and `RoomClient.connect(String, int, String)` accept a standard `java.net.InetSocketAddress` or `(host, controlPort)` pair and expose `sessionInfo()`, `advertisedPorts()`, and `currentBinding()`.
 
 #### 6. `QUIT` (Release Session & Close Connection Cleanly)
 **Request (`Client -> Server`):**

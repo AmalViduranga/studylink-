@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
 import lk.studylink.shared.protocol.FrameCodec;
@@ -699,6 +700,85 @@ class RoomControlServerTest {
             }
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void partialFrameBytesDoNotRefreshInactivityLeaseWhileValidRequestsExtendLease() throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults(); // 20,000 ms expiry
+        RoomSessionRegistry registry = new RoomSessionRegistry(config);
+        AtomicLong fakeNanos = new AtomicLong(1_000_000_000L);
+        long expiryNanos = TimeUnit.MILLISECONDS.toNanos(config.controlSessionExpiryMs());
+
+        try (RoomControlServer server = new RoomControlServer(
+                "127.0.0.1", 0, config, registry, fakeNanos::get)) {
+            server.start();
+
+            try (TestControlClient partialPeer = TestControlClient.connect(server.boundPort());
+                    TestControlClient healthyPeer = TestControlClient.connect(server.boundPort())) {
+                // Both register at t = 0
+                JsonObject hello1 = new JsonObject();
+                hello1.addProperty("displayName", "PartialPeer");
+                JsonObject resp1 = partialPeer.request("h1", RoomControlServer.OP_HELLO, hello1);
+                String partialSessionId = resp1.getAsJsonObject("data").get("sessionId").getAsString();
+
+                JsonObject join1 = new JsonObject();
+                join1.addProperty("roomId", "netprog");
+                partialPeer.request("j1", RoomControlServer.OP_JOIN, join1);
+                RoomBinding partialBinding = new RoomBinding(partialSessionId, "netprog", 1L);
+                assertTrue(registry.isCurrent(partialBinding));
+
+                JsonObject hello2 = new JsonObject();
+                hello2.addProperty("displayName", "HealthyPeer");
+                JsonObject resp2 = healthyPeer.request("h2", RoomControlServer.OP_HELLO, hello2);
+                String healthySessionId = resp2.getAsJsonObject("data").get("sessionId").getAsString();
+
+                JsonObject join2 = new JsonObject();
+                join2.addProperty("roomId", "revision");
+                healthyPeer.request("j2", RoomControlServer.OP_JOIN, join2);
+                RoomBinding healthyBinding = new RoomBinding(healthySessionId, "revision", 1L);
+                assertTrue(registry.isCurrent(healthyBinding));
+
+                // Advance clock to 15 seconds (< 20s expiry)
+                fakeNanos.addAndGet(TimeUnit.SECONDS.toNanos(15));
+                assertEquals(0, server.expireInactiveConnectionsNow());
+
+                // PartialPeer writes only 2 bytes of a 4-byte length prefix (or partial payload),
+                // while HealthyPeer sends a complete valid PING request.
+                partialPeer.out.write(new byte[] {0x00, 0x00});
+                partialPeer.out.flush();
+                Thread.sleep(40); // allow socket read to consume the partial prefix bytes
+
+                JsonObject pingResp = healthyPeer.request("p1", RoomControlServer.OP_PING, new JsonObject());
+                assertTrue(pingResp.get("ok").getAsBoolean());
+
+                // Advance clock by another 6 seconds (total 21s since t=0, 6s since t=15s)
+                fakeNanos.addAndGet(TimeUnit.SECONDS.toNanos(6));
+                assertTrue(fakeNanos.get() - 1_000_000_000L >= expiryNanos);
+
+                int expiredCount = server.expireInactiveConnectionsNow();
+                assertEquals(1, expiredCount, "Only the partial-frame peer should expire at t=21s");
+
+                assertTrue(server.awaitSessionClosed(partialSessionId, 2, TimeUnit.SECONDS));
+                assertFalse(registry.isCurrent(partialBinding));
+                assertTrue(registry.findSession(partialSessionId).isEmpty());
+
+                // HealthyPeer's lease was refreshed at t=15s and remains active
+                assertTrue(registry.isCurrent(healthyBinding));
+                JsonObject postExpiryPing = healthyPeer.request("p2", RoomControlServer.OP_PING, new JsonObject());
+                assertTrue(postExpiryPing.get("ok").getAsBoolean());
+
+                // PartialPeer's display name is immediately reusable
+                try (TestControlClient reusedPeer = TestControlClient.connect(server.boundPort())) {
+                    JsonObject reuseHello = new JsonObject();
+                    reuseHello.addProperty("displayName", "PartialPeer");
+                    JsonObject reuseResp = reusedPeer.request("h3", RoomControlServer.OP_HELLO, reuseHello);
+                    assertTrue(reuseResp.get("ok").getAsBoolean());
+                    String newSessionId = reuseResp.getAsJsonObject("data").get("sessionId").getAsString();
+                    assertNotEquals(partialSessionId, newSessionId);
+                }
+            }
         }
     }
 

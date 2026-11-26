@@ -22,12 +22,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
 import lk.studylink.shared.model.RoomDefinition;
@@ -82,6 +84,9 @@ public final class RoomControlServer implements AutoCloseable {
     private final int requestedPort;
     private final StudyLinkConfig config;
     private final RoomSessionRegistry registry;
+    private final LongSupplier nanoTimeSource;
+    private final long sessionExpiryNanos;
+    private final long expirySweepIntervalMs;
 
     private final ReentrantLock stateLock = new ReentrantLock();
     private final AtomicBoolean started = new AtomicBoolean(false);
@@ -89,6 +94,7 @@ public final class RoomControlServer implements AutoCloseable {
     private final CountDownLatch shutdownComplete = new CountDownLatch(1);
     private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
     private final Set<String> activeSessionIds = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, RegisteredConnection> registeredConnections = new ConcurrentHashMap<>();
     private final ReentrantLock cleanupMonitor = new ReentrantLock();
     private final Condition cleanupCondition = cleanupMonitor.newCondition();
 
@@ -96,6 +102,7 @@ public final class RoomControlServer implements AutoCloseable {
     private volatile InetSocketAddress boundAddress;
     private volatile Thread acceptorThread;
     private volatile ExecutorService clientExecutor;
+    private volatile ScheduledExecutorService expiryScheduler;
     private volatile Runnable afterSocketBoundTestHook;
 
     /**
@@ -129,6 +136,26 @@ public final class RoomControlServer implements AutoCloseable {
             StudyLinkConfig config,
             RoomSessionRegistry registry
     ) {
+        this(bindHost, requestedPort, config, registry, System::nanoTime);
+    }
+
+    /**
+     * Creates a room-control server with an explicit monotonic clock supplier (used by tests to
+     * exercise expiry boundary conditions deterministically).
+     *
+     * @param bindHost       host address or IP to bind (must not be {@code null} or blank)
+     * @param requestedPort  TCP port to bind ({@code 0} for an ephemeral OS-assigned port, or {@code 1..65535})
+     * @param config         validated StudyLink configuration (must not be {@code null})
+     * @param registry       shared session and room membership registry (must not be {@code null})
+     * @param nanoTimeSource monotonic time source in nanoseconds (must not be {@code null})
+     */
+    public RoomControlServer(
+            String bindHost,
+            int requestedPort,
+            StudyLinkConfig config,
+            RoomSessionRegistry registry,
+            LongSupplier nanoTimeSource
+    ) {
         Objects.requireNonNull(bindHost, "bindHost must not be null");
         if (bindHost.isBlank()) {
             throw new IllegalArgumentException("bindHost must not be blank");
@@ -140,6 +167,13 @@ public final class RoomControlServer implements AutoCloseable {
         this.requestedPort = requestedPort;
         this.config = Objects.requireNonNull(config, "config must not be null");
         this.registry = Objects.requireNonNull(registry, "registry must not be null");
+        this.nanoTimeSource = Objects.requireNonNull(nanoTimeSource, "nanoTimeSource must not be null");
+        int expiryMs = config.controlSessionExpiryMs();
+        if (expiryMs < 1) {
+            throw new IllegalArgumentException("controlSessionExpiryMs must be >= 1, found " + expiryMs);
+        }
+        this.sessionExpiryNanos = TimeUnit.MILLISECONDS.toNanos(expiryMs);
+        this.expirySweepIntervalMs = Math.max(10L, Math.min(200L, expiryMs / 10L));
     }
 
     /**
@@ -197,6 +231,20 @@ public final class RoomControlServer implements AutoCloseable {
             Thread acceptor = new Thread(this::acceptLoop, "studylink-rooms-acceptor-" + actualPort);
             acceptor.setDaemon(true);
             this.acceptorThread = acceptor;
+
+            ScheduledExecutorService expiryExec = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread t = new Thread(runnable, "studylink-rooms-expiry-" + actualPort);
+                t.setDaemon(true);
+                return t;
+            });
+            this.expiryScheduler = expiryExec;
+            expiryExec.scheduleWithFixedDelay(
+                    this::expireInactiveConnectionsNow,
+                    expirySweepIntervalMs,
+                    expirySweepIntervalMs,
+                    TimeUnit.MILLISECONDS
+            );
+
             this.started.set(true);
             acceptor.start();
         } finally {
@@ -291,6 +339,7 @@ public final class RoomControlServer implements AutoCloseable {
         final boolean isFirstCloser;
         final ServerSocket listenerToClose;
         final ExecutorService executorToShutdown;
+        final ScheduledExecutorService expiryToShutdown;
         final Thread acceptorToJoin;
 
         stateLock.lock();
@@ -298,6 +347,7 @@ public final class RoomControlServer implements AutoCloseable {
             isFirstCloser = closed.compareAndSet(false, true);
             listenerToClose = this.serverSocket;
             executorToShutdown = this.clientExecutor;
+            expiryToShutdown = this.expiryScheduler;
             acceptorToJoin = this.acceptorThread;
             closeQuietly(listenerToClose);
         } finally {
@@ -314,6 +364,15 @@ public final class RoomControlServer implements AutoCloseable {
         }
 
         try {
+            if (expiryToShutdown != null) {
+                expiryToShutdown.shutdownNow();
+            }
+
+            for (RegisteredConnection regConn : registeredConnections.values()) {
+                releaseConnection(regConn);
+            }
+            registeredConnections.clear();
+
             for (Socket clientSocket : activeSockets) {
                 closeQuietly(clientSocket);
             }
@@ -324,6 +383,14 @@ public final class RoomControlServer implements AutoCloseable {
             }
             activeSessionIds.clear();
             signalCleanupMonitor();
+
+            if (expiryToShutdown != null) {
+                try {
+                    expiryToShutdown.awaitTermination(SHUTDOWN_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
 
             if (executorToShutdown != null) {
                 executorToShutdown.shutdownNow();
@@ -360,6 +427,28 @@ public final class RoomControlServer implements AutoCloseable {
      */
     boolean hasQueuedLifecycleThreads() {
         return stateLock.hasQueuedThreads();
+    }
+
+    /**
+     * Evaluates all currently registered connections against the inactivity deadline using the
+     * monotonic clock source and expires any connection whose silence duration is at least
+     * {@code controlSessionExpiryMs}.
+     *
+     * @return number of connections expired during this sweep
+     */
+    int expireInactiveConnectionsNow() {
+        if (closed.get()) {
+            return 0;
+        }
+        long nowNanos = nanoTimeSource.getAsLong();
+        int expiredCount = 0;
+        for (RegisteredConnection regConn : registeredConnections.values()) {
+            if (regConn.tryMarkExpired(nowNanos, sessionExpiryNanos)) {
+                expiredCount++;
+                releaseConnection(regConn);
+            }
+        }
+        return expiredCount;
     }
 
     private void acceptLoop() {
@@ -416,6 +505,7 @@ public final class RoomControlServer implements AutoCloseable {
 
     private void handleClientConnection(Socket clientSocket) {
         SessionInfo boundSession = null;
+        RegisteredConnection registeredConn = null;
         try (Socket socket = clientSocket;
              InputStream in = socket.getInputStream();
              OutputStream out = socket.getOutputStream()) {
@@ -440,8 +530,18 @@ public final class RoomControlServer implements AutoCloseable {
                     break;
                 }
 
-                ConnectionDispatchOutcome outcome = dispatchRequest(request, requestId, boundSession);
+                ConnectionDispatchOutcome outcome = dispatchRequest(
+                        request,
+                        requestId,
+                        boundSession,
+                        registeredConn,
+                        clientSocket
+                );
+                if (outcome.connectionExpired()) {
+                    break;
+                }
                 boundSession = outcome.updatedSession();
+                registeredConn = outcome.registeredConnection();
 
                 FrameCodec.writeFrame(out, outcome.response());
                 if (outcome.closeConnectionAfterResponse()) {
@@ -449,10 +549,12 @@ public final class RoomControlServer implements AutoCloseable {
                 }
             }
         } catch (IOException ignored) {
-            // Connection dropped or closed during shutdown; cleanup runs in finally
+            // Connection dropped or closed during shutdown/expiry; cleanup runs in finally
         } finally {
             activeSockets.remove(clientSocket);
-            if (boundSession != null) {
+            if (registeredConn != null) {
+                releaseConnection(registeredConn);
+            } else if (boundSession != null) {
                 activeSessionIds.remove(boundSession.sessionId());
                 registry.closeSession(boundSession.sessionId());
             }
@@ -464,7 +566,9 @@ public final class RoomControlServer implements AutoCloseable {
     private ConnectionDispatchOutcome dispatchRequest(
             JsonObject request,
             String requestId,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn,
+            Socket clientSocket
     ) {
         if (!hasSupportedProtocolVersion(request)) {
             JsonObject err = buildErrorResponse(
@@ -472,7 +576,7 @@ public final class RoomControlServer implements AutoCloseable {
                     ERR_UNSUPPORTED_VERSION,
                     "Unsupported or missing protocol version 'v' (expected " + ProtocolConstants.PROTOCOL_VERSION + ")"
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         String op = extractOptionalStringField(request, "op");
@@ -482,7 +586,7 @@ public final class RoomControlServer implements AutoCloseable {
                     ERR_BAD_REQUEST,
                     "Request field 'op' must be a non-blank string"
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         final JsonObject data;
@@ -490,28 +594,58 @@ public final class RoomControlServer implements AutoCloseable {
             data = extractOptionalDataObject(request);
         } catch (IllegalArgumentException e) {
             JsonObject err = buildErrorResponse(requestId, ERR_BAD_REQUEST, e.getMessage());
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
+        }
+
+        if (!isKnownControlOperation(op)) {
+            JsonObject err = buildErrorResponse(
+                    requestId,
+                    ERR_UNSUPPORTED_OP,
+                    "Unsupported control operation: '" + op + "'"
+            );
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
+        }
+
+        if (registeredConn != null) {
+            long nowNanos = nanoTimeSource.getAsLong();
+            if (!registeredConn.tryRefreshActivity(nowNanos, sessionExpiryNanos)) {
+                releaseConnection(registeredConn);
+                return new ConnectionDispatchOutcome(null, null, null, true, true);
+            }
         }
 
         return switch (op) {
-            case OP_HELLO -> handleHello(requestId, data, boundSession);
-            case OP_LIST_ROOMS -> handleListRooms(requestId, request, data, boundSession);
-            case OP_JOIN -> handleJoin(requestId, request, data, boundSession);
-            case OP_LEAVE -> handleLeave(requestId, request, data, boundSession);
-            case OP_PING -> handlePing(requestId, request, data, boundSession);
-            case OP_QUIT -> handleQuit(requestId, request, data, boundSession);
+            case OP_HELLO -> handleHello(requestId, data, boundSession, registeredConn, clientSocket);
+            case OP_LIST_ROOMS -> handleListRooms(requestId, request, data, boundSession, registeredConn);
+            case OP_JOIN -> handleJoin(requestId, request, data, boundSession, registeredConn);
+            case OP_LEAVE -> handleLeave(requestId, request, data, boundSession, registeredConn);
+            case OP_PING -> handlePing(requestId, request, data, boundSession, registeredConn);
+            case OP_QUIT -> handleQuit(requestId, request, data, boundSession, registeredConn);
             default -> new ConnectionDispatchOutcome(
                     boundSession,
+                    registeredConn,
                     buildErrorResponse(requestId, ERR_UNSUPPORTED_OP, "Unsupported control operation: '" + op + "'"),
+                    false,
                     false
             );
         };
     }
 
+    private static boolean isKnownControlOperation(String op) {
+        return OP_HELLO.equals(op)
+                || OP_LIST_ROOMS.equals(op)
+                || OP_JOIN.equals(op)
+                || OP_LEAVE.equals(op)
+                || OP_PING.equals(op)
+                || OP_QUIT.equals(op);
+    }
+
     private ConnectionDispatchOutcome handleHello(
             String requestId,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn,
+            Socket clientSocket
     ) {
         if (boundSession != null) {
             JsonObject err = buildErrorResponse(
@@ -519,7 +653,7 @@ public final class RoomControlServer implements AutoCloseable {
                     ERR_ALREADY_REGISTERED,
                     "Session is already registered on this connection as '" + boundSession.displayName() + "'"
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         String rawDisplayName = (data == null) ? null : extractStrictStringField(data, "displayName");
@@ -529,7 +663,7 @@ public final class RoomControlServer implements AutoCloseable {
                     RoomRegistryErrorCode.INVALID_NAME.name(),
                     "HELLO requires a string 'displayName' inside 'data'"
             );
-            return new ConnectionDispatchOutcome(null, err, false);
+            return new ConnectionDispatchOutcome(null, null, err, false, false);
         }
 
         final SessionInfo newSession;
@@ -537,19 +671,24 @@ public final class RoomControlServer implements AutoCloseable {
             newSession = registry.registerSession(rawDisplayName);
         } catch (RoomRegistryException e) {
             JsonObject err = buildErrorResponse(requestId, e.errorCode().name(), e.getMessage());
-            return new ConnectionDispatchOutcome(null, err, false);
+            return new ConnectionDispatchOutcome(null, null, err, false, false);
         }
 
+        RegisteredConnection newRegConn = new RegisteredConnection(
+                newSession,
+                clientSocket,
+                nanoTimeSource.getAsLong()
+        );
         activeSessionIds.add(newSession.sessionId());
+        registeredConnections.put(newSession.sessionId(), newRegConn);
         if (closed.get()) {
-            activeSessionIds.remove(newSession.sessionId());
-            registry.closeSession(newSession.sessionId());
+            releaseConnection(newRegConn);
             JsonObject err = buildErrorResponse(
                     requestId,
                     RoomRegistryErrorCode.STALE_BINDING.name(),
                     "Server is shutting down"
             );
-            return new ConnectionDispatchOutcome(null, err, true);
+            return new ConnectionDispatchOutcome(null, null, err, true, false);
         }
 
         JsonObject ports = new JsonObject();
@@ -564,18 +703,25 @@ public final class RoomControlServer implements AutoCloseable {
         responseData.addProperty("displayName", newSession.displayName());
         responseData.add("ports", ports);
 
-        return new ConnectionDispatchOutcome(newSession, buildSuccessResponse(requestId, responseData), false);
+        return new ConnectionDispatchOutcome(
+                newSession,
+                newRegConn,
+                buildSuccessResponse(requestId, responseData),
+                false,
+                false
+        );
     }
 
     private ConnectionDispatchOutcome handleListRooms(
             String requestId,
             JsonObject request,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn
     ) {
         JsonObject precheckError = checkRegisteredAndSameSession(requestId, request, data, boundSession, OP_LIST_ROOMS);
         if (precheckError != null) {
-            return new ConnectionDispatchOutcome(boundSession, precheckError, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, precheckError, false, false);
         }
 
         JsonArray roomsArray = new JsonArray();
@@ -588,18 +734,25 @@ public final class RoomControlServer implements AutoCloseable {
 
         JsonObject responseData = new JsonObject();
         responseData.add("rooms", roomsArray);
-        return new ConnectionDispatchOutcome(boundSession, buildSuccessResponse(requestId, responseData), false);
+        return new ConnectionDispatchOutcome(
+                boundSession,
+                registeredConn,
+                buildSuccessResponse(requestId, responseData),
+                false,
+                false
+        );
     }
 
     private ConnectionDispatchOutcome handleJoin(
             String requestId,
             JsonObject request,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn
     ) {
         JsonObject precheckError = checkRegisteredAndSameSession(requestId, request, data, boundSession, OP_JOIN);
         if (precheckError != null) {
-            return new ConnectionDispatchOutcome(boundSession, precheckError, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, precheckError, false, false);
         }
 
         String roomId = (data == null) ? null : extractStrictStringField(data, "roomId");
@@ -609,7 +762,7 @@ public final class RoomControlServer implements AutoCloseable {
                     RoomRegistryErrorCode.UNKNOWN_ROOM.name(),
                     "JOIN requires a string 'roomId' inside 'data'"
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         final RoomBinding binding;
@@ -617,25 +770,32 @@ public final class RoomControlServer implements AutoCloseable {
             binding = registry.joinRoom(boundSession.sessionId(), roomId);
         } catch (RoomRegistryException e) {
             JsonObject err = buildErrorResponse(requestId, e.errorCode().name(), e.getMessage());
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         JsonObject responseData = new JsonObject();
         responseData.addProperty("sessionId", binding.sessionId());
         responseData.addProperty("roomId", binding.roomId());
         responseData.addProperty("revision", binding.revision());
-        return new ConnectionDispatchOutcome(boundSession, buildSuccessResponse(requestId, responseData), false);
+        return new ConnectionDispatchOutcome(
+                boundSession,
+                registeredConn,
+                buildSuccessResponse(requestId, responseData),
+                false,
+                false
+        );
     }
 
     private ConnectionDispatchOutcome handleLeave(
             String requestId,
             JsonObject request,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn
     ) {
         JsonObject precheckError = checkRegisteredAndSameSession(requestId, request, data, boundSession, OP_LEAVE);
         if (precheckError != null) {
-            return new ConnectionDispatchOutcome(boundSession, precheckError, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, precheckError, false, false);
         }
 
         final Optional<RoomBinding> invalidated;
@@ -643,7 +803,7 @@ public final class RoomControlServer implements AutoCloseable {
             invalidated = registry.leaveRoom(boundSession.sessionId());
         } catch (RoomRegistryException e) {
             JsonObject err = buildErrorResponse(requestId, e.errorCode().name(), e.getMessage());
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         JsonObject responseData = new JsonObject();
@@ -653,18 +813,25 @@ public final class RoomControlServer implements AutoCloseable {
         } else {
             responseData.add("leftRoomId", JsonNull.INSTANCE);
         }
-        return new ConnectionDispatchOutcome(boundSession, buildSuccessResponse(requestId, responseData), false);
+        return new ConnectionDispatchOutcome(
+                boundSession,
+                registeredConn,
+                buildSuccessResponse(requestId, responseData),
+                false,
+                false
+        );
     }
 
     private ConnectionDispatchOutcome handlePing(
             String requestId,
             JsonObject request,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn
     ) {
         JsonObject precheckError = checkRegisteredAndSameSession(requestId, request, data, boundSession, OP_PING);
         if (precheckError != null) {
-            return new ConnectionDispatchOutcome(boundSession, precheckError, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, precheckError, false, false);
         }
 
         if (registry.findSession(boundSession.sessionId()).isEmpty()) {
@@ -673,20 +840,27 @@ public final class RoomControlServer implements AutoCloseable {
                     RoomRegistryErrorCode.STALE_BINDING.name(),
                     "Session is no longer active: " + boundSession.sessionId()
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
         JsonObject responseData = new JsonObject();
         responseData.addProperty("sessionId", boundSession.sessionId());
         responseData.addProperty("pong", true);
-        return new ConnectionDispatchOutcome(boundSession, buildSuccessResponse(requestId, responseData), false);
+        return new ConnectionDispatchOutcome(
+                boundSession,
+                registeredConn,
+                buildSuccessResponse(requestId, responseData),
+                false,
+                false
+        );
     }
 
     private ConnectionDispatchOutcome handleQuit(
             String requestId,
             JsonObject request,
             JsonObject data,
-            SessionInfo boundSession
+            SessionInfo boundSession,
+            RegisteredConnection registeredConn
     ) {
         if (boundSession != null && hasMismatchedSessionId(request, data, boundSession.sessionId())) {
             JsonObject err = buildErrorResponse(
@@ -694,9 +868,13 @@ public final class RoomControlServer implements AutoCloseable {
                     RoomRegistryErrorCode.STALE_BINDING.name(),
                     "Request sessionId does not match this connection's bound session"
             );
-            return new ConnectionDispatchOutcome(boundSession, err, false);
+            return new ConnectionDispatchOutcome(boundSession, registeredConn, err, false, false);
         }
 
+        if (registeredConn != null) {
+            registeredConn.markClosed();
+            registeredConnections.remove(registeredConn.session.sessionId(), registeredConn);
+        }
         if (boundSession != null) {
             activeSessionIds.remove(boundSession.sessionId());
             registry.closeSession(boundSession.sessionId());
@@ -705,7 +883,7 @@ public final class RoomControlServer implements AutoCloseable {
 
         JsonObject responseData = new JsonObject();
         responseData.addProperty("closed", true);
-        return new ConnectionDispatchOutcome(null, buildSuccessResponse(requestId, responseData), true);
+        return new ConnectionDispatchOutcome(null, null, buildSuccessResponse(requestId, responseData), true, false);
     }
 
     private static JsonObject checkRegisteredAndSameSession(
@@ -836,6 +1014,20 @@ public final class RoomControlServer implements AutoCloseable {
         return response;
     }
 
+    private void releaseConnection(RegisteredConnection regConn) {
+        if (regConn == null) {
+            return;
+        }
+        regConn.markClosed();
+        String sessionId = regConn.session.sessionId();
+        registeredConnections.remove(sessionId, regConn);
+        activeSessionIds.remove(sessionId);
+        activeSockets.remove(regConn.socket);
+        registry.closeSession(sessionId);
+        closeQuietly(regConn.socket);
+        signalCleanupMonitor();
+    }
+
     private void signalCleanupMonitor() {
         cleanupMonitor.lock();
         try {
@@ -865,8 +1057,66 @@ public final class RoomControlServer implements AutoCloseable {
 
     private record ConnectionDispatchOutcome(
             SessionInfo updatedSession,
+            RegisteredConnection registeredConnection,
             JsonObject response,
-            boolean closeConnectionAfterResponse
+            boolean closeConnectionAfterResponse,
+            boolean connectionExpired
     ) {
+    }
+
+    private static final class RegisteredConnection {
+        private final SessionInfo session;
+        private final Socket socket;
+        private final ReentrantLock activityLock = new ReentrantLock();
+        private long lastActivityNanos;
+        private boolean expiredOrClosed;
+
+        private RegisteredConnection(SessionInfo session, Socket socket, long initialActivityNanos) {
+            this.session = session;
+            this.socket = socket;
+            this.lastActivityNanos = initialActivityNanos;
+        }
+
+        private boolean tryRefreshActivity(long nowNanos, long expiryNanos) {
+            activityLock.lock();
+            try {
+                if (expiredOrClosed) {
+                    return false;
+                }
+                if (nowNanos - lastActivityNanos >= expiryNanos) {
+                    expiredOrClosed = true;
+                    return false;
+                }
+                lastActivityNanos = nowNanos;
+                return true;
+            } finally {
+                activityLock.unlock();
+            }
+        }
+
+        private boolean tryMarkExpired(long nowNanos, long expiryNanos) {
+            activityLock.lock();
+            try {
+                if (expiredOrClosed) {
+                    return false;
+                }
+                if (nowNanos - lastActivityNanos < expiryNanos) {
+                    return false;
+                }
+                expiredOrClosed = true;
+                return true;
+            } finally {
+                activityLock.unlock();
+            }
+        }
+
+        private void markClosed() {
+            activityLock.lock();
+            try {
+                expiredOrClosed = true;
+            } finally {
+                activityLock.unlock();
+            }
+        }
     }
 }
