@@ -36,18 +36,18 @@ During a classroom tutorial or revision session, students often split their atte
 
 ---
 
-## 2. Current Starter Capabilities vs. Planned Features
+## 2. Current Capabilities vs. Planned Features
 
-> **Honest Implementation Status (Phase-0 Foundation):** This repository currently provides the **verified Phase-0 starter baseline**. Working network listeners and feature UI panels are reserved for their respective owners (`M1`–`M5`).
+> **Honest Implementation Status:** `M1` TCP room control (`FrameCodec`, `RoomSessionRegistry`, `RoomControlServer`, `RoomClient`) is implemented and runs live from `ServerMain` (`M1-05`). `M5` Java NIO live room chat (`NioFrameAccumulator`, `ChatProtocol`, `ChatServer`, `ChatClient`, `ChatPanel`) is implemented and tested, though `ServerMain` currently starts only the `M1` rooms listener. The Swing room connection/switcher workflow is planned for `M1-06`, and the `M2`–`M4` network services remain planned for their respective feature branches.
 
-| Capability / Component | Phase-0 Status (Today's Build) | Final LAN Demo Target (Release Baseline) |
+| Capability / Component | Current Status (Today's Build) | Final LAN Demo Target (Release Baseline) |
 | :--- | :--- | :--- |
 | **Maven Reactor & Wrapper (`shared`, `server`, `client`)** | **Implemented & Verified** — Builds on JDK 21 with Maven Wrapper `3.9.11`; produces shaded `studylink-server.jar` and `studylink-client.jar`. | Same build contract (`./mvnw clean verify`). |
 | **Shared Config Loader & CLI Diagnostics (`--help`, `--check-config`)** | **Implemented & Verified** — Validates required properties, port ranges (`1..65535`), distinct service ports, limits, and pre-TLS paths headlessly; prints non-secret JSON summary with Gson. | Used by both applications at startup and in CI. |
-| **Starter Server Launch (`ServerMain`)** | **Implemented & Verified** — Loads config, prints effective settings and the 5 planned service endpoints (`45400`–`45404`), explains that listeners are reserved for `M1`–`M5`, and exits cleanly (`0`). | Binds and runs all 5 live services concurrently in one host process. |
-| **Starter Client Launch (`DesktopMain` + `StarterFrame`)** | **Implemented & Verified** — Applies FlatLaf Light `3.6.1` on the Swing EDT and opens an honest starter status window showing configured rooms, ports, and feature ownership. | Full connection screen, room switcher, live chat tab, shared files tab with progress bar, and private note dialog. |
-| **Bootstrap Unit & Loopback Socket Smoke Tests** | **Implemented & Verified** — 15 headless JUnit Jupiter tests covering config validation, invalid inputs, CLI modes, and bounded loopback TCP/UDP ephemeral-port smoke checks. | Extended with `M1`–`M5` unit/integration tests and SRS acceptance tests `T01`–`T12` ([docs/testing/test-plan.md](docs/testing/test-plan.md)). |
-| **M1–M5 Network Features (`rooms`, `discovery`, `files`, `notes`, `chat`)** | **Planned** — Package directories scaffolded and reserved for individual owners. | Fully integrated across two or more classroom laptops on IPv4 LAN. |
+| **Host Server Launch (`ServerMain`)** | **Implemented & Verified (`M1-05`)** — Loads config, initializes `RoomSessionRegistry`, binds and starts the blocking TCP `RoomControlServer` (`server.host:port.rooms`, default `127.0.0.1:45401`), reports the listening endpoint, stays alive serving `HELLO`/`LIST_ROOMS`/`JOIN`/`LEAVE`/`PING`/`QUIT`, exits with code `1` on bind failure, and releases the socket on shutdown. Currently starts only the `M1` rooms listener. | Binds and runs all 5 live services concurrently in one host process. |
+| **Desktop Client Launch (`DesktopMain` + `StarterFrame`)** | **Starter Window Active (`M1-06` Planned)** — Applies FlatLaf Light `3.6.1` on the Swing EDT and opens the starter status window. `RoomClient` (`M1-04`) and `ChatPanel` (`M5`) are implemented and tested; the Swing room connection and switcher workflow is planned for `M1-06`. | Full connection screen, room switcher, live chat tab, shared files tab with progress bar, and private note dialog. |
+| **Unit & Loopback Socket Integration Tests** | **Implemented & Verified** — Headless JUnit Jupiter suite covering config validation, CLI modes, `ServerMain` room-control launcher lifecycle, `FrameCodec`, `RoomSessionRegistry`, `RoomControlServer`, `RoomClient` (including 5 s ping / 20 s inactivity expiry), and `M5` NIO chat (`NioFrameAccumulator`, `ChatServer`, `ChatClient`, `ChatPanel`). | Extended with `M1-06`, `M2`–`M4` unit/integration tests, and SRS acceptance tests `T01`–`T12` ([docs/testing/test-plan.md](docs/testing/test-plan.md)). |
+| **M1–M5 Network Features (`rooms`, `discovery`, `files`, `notes`, `chat`)** | **In Progress (`M1` & `M5` Implemented)** — `M1` room control runs from `ServerMain`; `M5` chat components (`ChatServer`, `ChatClient`, `ChatPanel`) are implemented and tested (while `ServerMain` starts only the `M1` rooms listener); Swing room workflow is planned for `M1-06`; `M2` (`discovery`), `M3` (`files`), and `M4` (`notes`) remain planned for their feature owners. | Fully integrated across two or more classroom laptops on IPv4 LAN. |
 
 ---
 
@@ -189,8 +189,11 @@ java -jar client/target/studylink-client.jar --help
 java -jar server/target/studylink-server.jar --config config/studylink.example.properties --check-config
 java -jar client/target/studylink-client.jar --config config/studylink.example.properties --check-config
 
-# 5. Launch the Phase-0 starter server and Swing desktop client
+# 5. Launch the host server (binds TCP room-control on server.host:port.rooms, default 127.0.0.1:45401)
+#    Stop interactively with Ctrl+C, or from another terminal with: Stop-Process -Id <PID>
 java -jar server/target/studylink-server.jar --config config/studylink.properties
+
+# 6. Launch the Swing desktop client
 java -jar client/target/studylink-client.jar --config config/studylink.properties
 ```
 
@@ -215,19 +218,22 @@ java -jar client/target/studylink-client.jar --help
 java -jar server/target/studylink-server.jar --config config/studylink.example.properties --check-config
 java -jar client/target/studylink-client.jar --config config/studylink.example.properties --check-config
 
-# 5. Launch the Phase-0 starter server and Swing desktop client
+# 5. Launch the host server (binds TCP room-control on server.host:port.rooms, default 127.0.0.1:45401)
+#    Stop interactively with Ctrl+C, or from another terminal with: kill -TERM <PID>
 java -jar server/target/studylink-server.jar --config config/studylink.properties
+
+# 6. Launch the Swing desktop client
 java -jar client/target/studylink-client.jar --config config/studylink.properties
 ```
 
-### Expected Output (Today's Starter vs. Final Release)
+### Expected Output (Today's Build vs. Final Release)
 
 - **`--check-config` (Valid Config):** Exits with code `0` and prints a single-line Gson JSON summary of effective non-secret settings:
   ```json
   {"status":"OK","component":"studylink-server","configSource":"config\\studylink.example.properties","protocolVersion":1,"serverId":"studylink-local","serverHost":"127.0.0.1","networkInterface":"loopback","ports":{"discoveryUdp":45400,"roomsTcp":45401,"chatNioTcp":45402,"filesTcp":45403,"notesTlsTcp":45404},"dataDir":"var/room-files","tls":{"protocol":"TLSv1.3","serverStore":"local/host.p12","clientTrustStore":"local/host-trust.p12"},"rooms":[{"id":"netprog","name":"Network Programming"},{"id":"revision","name":"Exam Revision"},{"id":"workshop","name":"Project Workshop"}],"limits":{"maxFrameBytes":16384,"maxUdpBytes":1200,"maxChatTextBytes":2048,"maxNoteTextBytes":2048,"maxFileSizeBytes":5242880,"fileWorkerThreads":4,"fileQueueCapacity":8,"maxSlowClientQueueBytes":65536}}
   ```
 - **`--check-config` (Missing or Invalid Config):** Exits with a nonzero code (`1` or `2`) and prints a descriptive diagnostic to `stderr` (for example, `Configuration file not found` or `Port out of range for 'port.rooms'`).
-- **Today's Normal Server Launch (`ServerMain`):** Validates configuration, prints the host summary, predefined rooms, and the five planned service endpoints (`M1`–`M5`), states that network listeners are planned and not bound in the starter build, and exits cleanly with code `0`.
+- **Today's Normal Server Launch (`ServerMain`):** Validates configuration, initializes `RoomSessionRegistry`, binds and starts `RoomControlServer` on `server.host:port.rooms` (default `127.0.0.1:45401`), prints `[studylink-server] TCP room-control service listening on 127.0.0.1:45401`, and stays running to serve `HELLO`, `LIST_ROOMS`, `JOIN`, `LEAVE`, `PING`, and `QUIT` until stopped with `Ctrl+C` (or `Stop-Process -Id <PID>` / `kill -TERM <PID>`). If the configured port is already occupied, it prints `[studylink-server] Failed to bind TCP room-control service on <host>:<port>: ...` to `stderr` and exits with code `1`.
 - **Today's Normal Client Launch (`DesktopMain`):** Initializes FlatLaf Light `3.6.1` on the Swing Event Dispatch Thread and opens the `StudyLink Desktop Client — Starter Baseline` window showing effective non-secret settings and the five planned feature areas.
 - **Final Classroom Release Launch:** Once `M1`–`M5` merge their feature branches, `studylink-server.jar` remains running with all five listeners active (`45400`–`45404`) and the local host inbox console ready, while `studylink-client.jar` opens the interactive connection screen and room workspace.
 
