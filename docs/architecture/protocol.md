@@ -58,43 +58,87 @@ Every stream control message consists of:
   - **Blocking streams (`M1`, `M3` metadata, `M4` TLS):** `FrameCodec.writeFrame(OutputStream, JsonObject)` preserves explicit JSON `null` properties (`JsonNull`), rejects non-finite numeric values (`NaN`, `+Infinity`, `-Infinity`), and validates that the serialized UTF-8 byte count is in `1..16,384` before writing any byte to the stream. `FrameCodec.readFrame(InputStream)` reads raw bytes without a lookahead buffer (leaving subsequent frames or `M3` raw file bytes untouched), returns `null` on a clean EOF at a frame boundary (`0` prefix bytes available), throws `EOFException` on a truncated prefix or payload, and throws `FrameFormatException` on out-of-range lengths, invalid UTF-8, malformed JSON, trailing non-whitespace tokens, or non-object JSON roots.
   - **Non-blocking NIO reuse (`M5`):** `M5` owns `Selector` registrations, per-channel `ByteBuffer` accumulation, and partial socket writes, and reuses `FrameCodec.encodeFrameBytes(JsonObject)` for outbound write queues plus `FrameCodec.validatePayloadLength(int)` / `FrameCodec.decodeLengthPrefix(byte[], int)` and `FrameCodec.decodePayloadBytes(byte[], int, int)` once a complete `4 + L` frame has accumulated in a channel buffer.
 
-### 3.2 `HELLO` and `JOIN` Interface Examples and Membership Handoff (SRS Sections 5.1 & 6.3)
+### 3.2 TCP Room-Control Operations (`45401` — `RoomControlServer`) and Membership Handoff (SRS Sections 5.1 & 6.3)
 
-> **Interface Examples Notice:** The `HELLO` and `JOIN` JSON envelopes below document the wire contract connecting client session/room state (`SessionInfo`, `RoomBinding`) to `RoomSessionRegistry`. The blocking TCP socket listener and operation dispatcher for port `45401` are planned for the next `M1` issue (`M1-03`).
+`lk.studylink.server.rooms.RoomControlServer` serves the six blocking TCP control operations below using `FrameCodec`. Each request must carry `"v": 1` (exact numeric value `1`, compared without floating-point precision loss so `1` and `1.0` are accepted while `1.0000000000000001` or `"1"` is rejected with `UNSUPPORTED_VERSION`) and a non-blank string `"id"` (echoed verbatim without trimming in both success and error responses). Each TCP connection owns at most one registered session bound during `HELLO`. All post-`HELLO` operations execute strictly against the connection's own bound `sessionId`; any request supplying a mismatched `sessionId` is rejected with `STALE_BINDING` without modifying another client's session. If a frame is unreadable/truncated or lacks a non-blank string `"id"`, the server closes that connection and releases its bound session in `finally`.
 
-**`HELLO` Request (`Client -> Server` on TCP `45401`, interface example):**
+#### 1. `HELLO` (Register Display Name & Bind Connection Session)
+**Request (`Client -> Server`):**
 ```json
 {"v":1,"id":"r01","op":"HELLO","data":{"displayName":"Amal"}}
 ```
-
-**`HELLO` Success Response (`Server -> Client` on TCP `45401`, interface example):**
+**Success Response (`Server -> Client`):**
 ```json
 {"v":1,"id":"r01","ok":true,"data":{"sessionId":"s-demo","displayName":"Amal","ports":{"discoveryUdp":45400,"roomsTcp":45401,"chatNioTcp":45402,"filesTcp":45403,"notesTlsTcp":45404}}}
 ```
 
-After connecting on TCP port `45401` and completing `HELLO` (which registers the student's display name in `RoomSessionRegistry.registerSession(...)` and returns `sessionId` plus the server's active service ports), the client requests to join a room:
+#### 2. `LIST_ROOMS` (Retrieve Configured Room Catalogue)
+**Request (`Client -> Server`):**
+```json
+{"v":1,"id":"r02","op":"LIST_ROOMS","data":{}}
+```
+**Success Response (`Server -> Client`):**
+```json
+{"v":1,"id":"r02","ok":true,"data":{"rooms":[{"id":"netprog","name":"Network Programming"},{"id":"revision","name":"Exam Revision"},{"id":"workshop","name":"Project Workshop"}]}}
+```
 
-**`JOIN` Request (`Client -> Server` on TCP `45401`):**
+#### 3. `JOIN` (Join or Switch Active Room)
+**Request (`Client -> Server`):**
 ```json
 {"v":1,"id":"r17","op":"JOIN","data":{"roomId":"netprog"}}
 ```
-
-**`JOIN` Success Response (`Server -> Client` on TCP `45401`):**
+**Success Response (`Server -> Client`):**
 ```json
 {"v":1,"id":"r17","ok":true,"data":{"sessionId":"s-demo","roomId":"netprog","revision":2}}
 ```
 
-**Error Response Envelope (`ok = false`):**
+#### 4. `LEAVE` (Release Active Room Binding While Keeping Session & Name)
+**Request (`Client -> Server`):**
+```json
+{"v":1,"id":"r18","op":"LEAVE","data":{}}
+```
+**Success Response (`Server -> Client`):**
+```json
+{"v":1,"id":"r18","ok":true,"data":{"sessionId":"s-demo","leftRoomId":"netprog"}}
+```
+*(If the session was already outside all rooms, `"leftRoomId"` is `null`.)*
+
+#### 5. `PING` (Connection Liveness Check)
+**Request (`Client -> Server`):**
+```json
+{"v":1,"id":"r19","op":"PING","data":{}}
+```
+**Success Response (`Server -> Client`):**
+```json
+{"v":1,"id":"r19","ok":true,"data":{"sessionId":"s-demo","pong":true}}
+```
+
+#### 6. `QUIT` (Release Session & Close Connection Cleanly)
+**Request (`Client -> Server`):**
+```json
+{"v":1,"id":"r20","op":"QUIT","data":{}}
+```
+**Success Response (`Server -> Client`):**
+```json
+{"v":1,"id":"r20","ok":true,"data":{"closed":true}}
+```
+
+#### Error Response Envelope (`ok = false`)
 When an operation fails validation, the server echoes the request `"id"` with `"ok": false` and a stable error code:
 ```json
-{"v":1,"id":"r17","ok":false,"error":{"code":"NAME_IN_USE","message":"Display name is already active"}}
+{"v":1,"id":"r17","ok":false,"error":{"code":"NAME_IN_USE","message":"Display name 'Amal' is already in use"}}
 ```
 
 Standard error codes across features (SRS Sections 5 & 6.3–6.4):
 - `NAME_IN_USE` — Display name is already taken by an active session (locale-independent code-point case-insensitive comparison via `Character.toLowerCase(Character.toUpperCase(cp))`, matching `String.equalsIgnoreCase`).
-- `INVALID_NAME` — Display name is empty or outside `2–24` letters/digits/spaces (`<= 48` UTF-8 bytes after trim).
-- `UNKNOWN_ROOM` — `roomId` is not one of the configured rooms (`netprog`, `revision`, `workshop`).
-- `STALE_BINDING` — `(sessionId, roomId, revision)` is no longer the current active binding for that session.
+- `INVALID_NAME` — Display name is missing, empty, or outside `2–24` letters/digits/spaces (`<= 48` UTF-8 bytes after trim).
+- `UNKNOWN_ROOM` — `roomId` is missing or not one of the configured rooms (`netprog`, `revision`, `workshop`).
+- `STALE_BINDING` — `(sessionId, roomId, revision)` is no longer current, session is closed, or a request supplied a `sessionId` that does not match the connection's bound session.
+- `NOT_REGISTERED` — `LIST_ROOMS`, `JOIN`, `LEAVE`, or `PING` was sent before completing `HELLO` on the connection.
+- `ALREADY_REGISTERED` — A second `HELLO` was sent on a connection that already owns a registered session.
+- `UNSUPPORTED_OP` — Request `"op"` is not one of the supported operations.
+- `UNSUPPORTED_VERSION` — Request `"v"` is missing or not `1`.
+- `BAD_REQUEST` — Request `"op"` is blank or `"data"` is not a JSON object.
 - `TOO_LARGE` — Frame (`> 16,384` bytes), chat/note text (`> 2,048` UTF-8 bytes), or file upload (`> 5,242,880` bytes) exceeds limits.
 - `INVALID_FILE` — Disallowed extension (only `.pdf` and `.txt` allowed), path separator/traversal in basename,basename `> 100` UTF-8 bytes, empty file, truncated stream, or SHA-256 digest mismatch.
 - `ROOM_FILE_LIMIT` — Room already holds the maximum `25` completed files.
