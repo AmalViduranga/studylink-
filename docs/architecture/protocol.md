@@ -2,7 +2,7 @@
 
 - **Baseline reference:** [StudyLink Project Report and SRS](../report/StudyLink_Project_Report_and_SRS.pdf) (Sections 3, 5, and 6.3–6.4)
 - **Protocol version:** `v = 1`
-- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`), the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec` and `FrameFormatException`), the shared membership contracts (`lk.studylink.shared.model.RoomBinding`, `SessionInfo`, `MembershipView`, `BindingInvalidationListener`), the server's in-memory session and room membership registry (`lk.studylink.server.rooms.RoomSessionRegistry`, `DisplayNamePolicy`, `RoomRegistryErrorCode`, `RoomRegistryException`), the blocking TCP room-control server with 20-second inactive-session expiry (`lk.studylink.server.rooms.RoomControlServer`), and the blocking TCP room-control client with automatic 5-second `PING` heartbeats (`lk.studylink.client.rooms.RoomClient`, `AdvertisedServicePorts`, `RoomClientException`) are **implemented and tested**. `ServerMain` launcher wiring (`M1-05`), Swing room integration (`M1-06`), and the `M2`–`M5` service listeners remain planned for their respective feature issues.
+- **Current implementation status:** Protocol constants (`lk.studylink.shared.protocol.ProtocolConstants`), the shared 4-byte length-prefixed UTF-8 JSON stream frame codec (`lk.studylink.shared.protocol.FrameCodec`, `FrameFormatException`, `NioFrameAccumulator`, `ChatProtocol`), the shared membership and chat models (`lk.studylink.shared.model.RoomBinding`, `SessionInfo`, `MembershipView`, `BindingInvalidationListener`, `ChatEvent`), the server's in-memory session and room membership registry (`lk.studylink.server.rooms.RoomSessionRegistry`, `DisplayNamePolicy`, `RoomRegistryErrorCode`, `RoomRegistryException`), the blocking TCP room-control server with 20-second inactive-session expiry (`lk.studylink.server.rooms.RoomControlServer`), the blocking TCP room-control client with automatic 5-second `PING` heartbeats (`lk.studylink.client.rooms.RoomClient`, `AdvertisedServicePorts`, `RoomClientException`), and **Member 5's Java NIO Live Room Chat** (`lk.studylink.server.chat.ChatServer`, `lk.studylink.client.chat.ChatClient`, `lk.studylink.client.ui.ChatPanel`) are **implemented and tested**. `ServerMain` launcher wiring (`M1-05`), Swing room integration (`M1-06`), and the `M2`–`M4` socket listeners remain planned for their respective feature branches.
 
 ---
 
@@ -147,6 +147,9 @@ Standard error codes across features (SRS Sections 5 & 6.3–6.4):
 - `ROOM_FILE_LIMIT` — Room already holds the maximum `25` completed files.
 - `BUSY` — File transfer worker pool (`4` active workers + `8` queued tasks) is full.
 - `INBOX_FULL` — Host private-note inbox for the room has reached `100` notes.
+- `NOT_SUBSCRIBED` — `CHAT_SEND` was sent on a chat channel before completing `SUBSCRIBE`.
+- `BAD_REQUEST` — Missing/malformed fields, blank `"op"`, non-object `"data"`, or empty/NUL-containing chat message.
+- `UNSUPPORTED_OP` / `UNSUPPORTED_VERSION` — Unknown `"op"` or `"v" != 1`.
 
 #### Consumer API Handoff (`MembershipView` & `RoomSessionRegistry`)
 
@@ -212,6 +215,42 @@ Each file operation opens a dedicated TCP connection to port `45403` served by t
 - Client sends a length-prefixed JSON `PRIVATE_NOTE` request containing `RoomBinding`, idempotency `requestId`, and UTF-8 `text` (`1..2,048` bytes).
 - Server verifies the room binding, stores the note in host memory (up to `100` notes per room), and returns a length-prefixed JSON receipt containing `noteId` and `requestId`. Retrying the same `(sessionId, requestId)` returns the existing receipt without duplicating the note.
 - Note bodies are **never** written to public room traffic, durable disk files, or normal console logs; the host operator inspects notes locally via the server console (`list` / `read <noteId>`).
+
+### 3.6 Live Room Chat over Java NIO (Port `45402` — M5 Chat)
+
+Implemented by `lk.studylink.server.chat.ChatServer`, `lk.studylink.client.chat.ChatClient`, `lk.studylink.shared.protocol.ChatProtocol`, `lk.studylink.shared.protocol.NioFrameAccumulator`, and `lk.studylink.shared.model.ChatEvent` (full architecture details in [chat-nio.md](chat-nio.md)).
+
+#### 1. `SUBSCRIBE` (Bind Chat Channel to Active `RoomBinding`)
+**Request (`Client -> Server` on NIO TCP `45402`):**
+```json
+{"v":1,"id":"c-1","op":"SUBSCRIBE","data":{"sessionId":"s-demo","roomId":"netprog","revision":2}}
+```
+**Success Response (`Server -> Client`):**
+```json
+{"v":1,"id":"c-1","ok":true,"data":{"sessionId":"s-demo","roomId":"netprog","revision":2,"subscribed":true}}
+```
+*(If `MembershipView.isCurrent(binding)` is `false` or the session is closed, returns `ok: false` with `STALE_BINDING`.)*
+
+#### 2. `CHAT_SEND` (Submit UTF-8 Chat Message `1..2,048` Bytes)
+**Request (`Client -> Server` on NIO TCP `45402`):**
+```json
+{"v":1,"id":"c-2","op":"CHAT_SEND","data":{"text":"Lecture 07 covers Selector!"}}
+```
+- The server ignores any client-supplied room target and always broadcasts to the channel's verified server-side `RoomBinding.roomId()` after re-checking `MembershipView.isCurrent(binding)`. Any mismatched `sessionId`/`roomId`/`revision` in `data` is rejected with `STALE_BINDING`.
+- Empty/blank messages or messages containing `\0` return `BAD_REQUEST`; messages exceeding `2,048` UTF-8 bytes return `TOO_LARGE`.
+
+**Success ACK (`Server -> Sender`):**
+```json
+{"v":1,"id":"c-2","ok":true,"data":{"messageId":"m-1","roomId":"netprog","sentAtEpochMs":1732624800000,"displayTime":"18:10:00"}}
+```
+
+#### 3. `CHAT_EVENT` (Server-Pushed Broadcast to Current Room Subscribers)
+**Unsolicited Event (`Server -> All Current Room Subscribers, Including Sender`):**
+```json
+{"v":1,"op":"CHAT_EVENT","data":{"messageId":"m-1","roomId":"netprog","senderSessionId":"s-demo","senderName":"Amal","text":"Lecture 07 covers Selector!","sentAtEpochMs":1732624800000,"displayTime":"18:10:00"}}
+```
+- Slow-client protection disconnects any peer whose pending outbound byte queue exceeds `65,536` bytes (`limits.maxSlowClientQueueBytes`).
+- Messages are strictly transient in RAM with no permanent disk storage or history replay.
 
 ---
 
