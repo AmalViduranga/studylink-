@@ -140,6 +140,10 @@ class ServerStarterAndSocketSmokeTest {
                 );
                 int bindExitCode = occupiedServer.process().exitValue();
                 assertEquals(1, bindExitCode, "Occupied-port bind failure must return exit code 1");
+                assertTrue(
+                        occupiedServer.awaitOutputComplete(3, TimeUnit.SECONDS),
+                        "Timed out waiting for occupied-port child output reader to finish"
+                );
                 String conflictOutput = occupiedServer.capturedOutput();
                 assertTrue(
                         conflictOutput.contains("Failed to bind TCP room-control service on " + expectedEndpoint),
@@ -419,6 +423,7 @@ class ServerStarterAndSocketSmokeTest {
         private final Process process;
         private final StringBuffer outputBuffer = new StringBuffer();
         private final CountDownLatch listeningLatch = new CountDownLatch(1);
+        private final CountDownLatch outputCompleteLatch = new CountDownLatch(1);
         private final Thread outputReaderThread;
         private volatile String expectedEndpoint;
 
@@ -440,6 +445,8 @@ class ServerStarterAndSocketSmokeTest {
                     }
                 }
             } catch (IOException ignored) {
+            } finally {
+                outputCompleteLatch.countDown();
             }
         }
 
@@ -453,6 +460,10 @@ class ServerStarterAndSocketSmokeTest {
                 return true;
             }
             return listeningLatch.await(timeout, unit);
+        }
+
+        private boolean awaitOutputComplete(long timeout, TimeUnit unit) throws InterruptedException {
+            return outputCompleteLatch.await(timeout, unit);
         }
 
         private String capturedOutput() {
