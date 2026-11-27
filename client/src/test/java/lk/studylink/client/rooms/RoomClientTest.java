@@ -22,11 +22,15 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import lk.studylink.server.rooms.RoomControlServer;
 import lk.studylink.server.rooms.RoomSessionRegistry;
 import lk.studylink.shared.config.StudyLinkConfig;
@@ -555,6 +559,312 @@ class RoomClientTest {
         }
     }
 
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void closeDuringPendingHelloCancelsAttemptUnblocksPromptlyStartsNoHeartbeatAndKeepsClientReusable()
+            throws Exception {
+        StudyLinkConfig fastPingConfig = configWithTimers(30, 1_000);
+        CountDownLatch helloReceivedByPeer = new CountDownLatch(1);
+        CountDownLatch releaseHelloReply = new CountDownLatch(1);
+        CountDownLatch extraFrameOnCancelledPeer = new CountDownLatch(1);
+
+        try (ServerSocket delayedPeer = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
+                RoomClient client = new RoomClient(fastPingConfig, 5_000, true)) {
+            Thread peerThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = delayedPeer.accept();
+                        InputStream in = socket.getInputStream();
+                        OutputStream out = socket.getOutputStream()) {
+                    socket.setSoTimeout(300);
+                    JsonObject helloReq = FrameCodec.readFrame(in);
+                    assertNotNull(helloReq);
+                    String helloId = helloReq.get("id").getAsString();
+                    helloReceivedByPeer.countDown();
+
+                    releaseHelloReply.await(5, TimeUnit.SECONDS);
+                    try {
+                        FrameCodec.writeFrame(out, buildHelloSuccess(helloId, "s-stale-1", "Amal"));
+                    } catch (IOException ignoredSocketClosed) {
+                        return;
+                    }
+
+                    // Observe whether a cancelled attempt ever transmits a post-HELLO frame (e.g. auto-PING)
+                    try {
+                        JsonObject extra = FrameCodec.readFrame(in);
+                        if (extra != null) {
+                            extraFrameOnCancelledPeer.countDown();
+                        }
+                    } catch (IOException ignored) {
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+
+            ExecutorService connectExec = Executors.newSingleThreadExecutor();
+            try {
+                Future<SessionInfo> connectFuture = connectExec.submit(
+                        () -> client.connect("127.0.0.1", delayedPeer.getLocalPort(), "Amal"));
+                assertTrue(helloReceivedByPeer.await(2, TimeUnit.SECONDS));
+
+                // Call close() while HELLO reply is still held by peer
+                long closeStartNanos = System.nanoTime();
+                client.close();
+                long closeElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStartNanos);
+                assertTrue(
+                        closeElapsedMs < 500L,
+                        "close() during pending HELLO must return promptly, took " + closeElapsedMs + " ms");
+
+                // Pending connect() must unblock and fail immediately even before peer releases HELLO reply
+                ExecutionException execEx = assertThrows(
+                        ExecutionException.class,
+                        () -> connectFuture.get(1, TimeUnit.SECONDS),
+                        "Pending connect() cancelled by close() must unblock and fail without publishing a session");
+                assertTrue(execEx.getCause() instanceof RoomClientException);
+
+                // Release the peer's HELLO reply and confirm the client remains disconnected with no heartbeat
+                releaseHelloReply.countDown();
+                assertFalse(client.isConnected(), "Client must remain disconnected after close() during HELLO");
+                assertEquals(Optional.empty(), client.sessionInfo());
+                assertEquals(Optional.empty(), client.servicePorts());
+                assertFalse(
+                        extraFrameOnCancelledPeer.await(120, TimeUnit.MILLISECONDS),
+                        "Cancelled connect attempt must never start an automatic PING heartbeat");
+            } finally {
+                releaseHelloReply.countDown();
+                connectExec.shutdownNow();
+                peerThread.join(2_000);
+            }
+
+            // Client must remain reusable after close()
+            RoomSessionRegistry registry = new RoomSessionRegistry(fastPingConfig);
+            try (RoomControlServer realServer = new RoomControlServer("127.0.0.1", 0, fastPingConfig, registry)) {
+                realServer.start();
+                SessionInfo freshSession = client.connect("127.0.0.1", realServer.boundPort(), "Amal");
+                assertTrue(client.isConnected());
+                assertEquals("Amal", freshSession.displayName());
+                assertTrue(client.ping());
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void staleDelayedHelloFromOlderConnectAttemptCannotReplaceNewerEstablishedSession() throws Exception {
+        StudyLinkConfig fastPingConfig = configWithTimers(40, 1_000);
+        CountDownLatch peer1HelloReceived = new CountDownLatch(1);
+        CountDownLatch releasePeer1Reply = new CountDownLatch(1);
+        CountDownLatch peer1ExtraFrame = new CountDownLatch(1);
+        CountDownLatch releasePeer2 = new CountDownLatch(1);
+        AtomicInteger peer2PingCount = new AtomicInteger();
+
+        try (ServerSocket peer1 = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
+                ServerSocket peer2 = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
+                RoomClient client = new RoomClient(fastPingConfig, 5_000, true)) {
+            Thread peer1Thread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = peer1.accept();
+                        InputStream in = socket.getInputStream();
+                        OutputStream out = socket.getOutputStream()) {
+                    socket.setSoTimeout(250);
+                    JsonObject helloReq = FrameCodec.readFrame(in);
+                    assertNotNull(helloReq);
+                    String id = helloReq.get("id").getAsString();
+                    peer1HelloReceived.countDown();
+
+                    releasePeer1Reply.await(5, TimeUnit.SECONDS);
+                    try {
+                        FrameCodec.writeFrame(out, buildHelloSuccess(id, "s-old-1", "Amal"));
+                    } catch (IOException ignoredSocketClosed) {
+                        return;
+                    }
+                    try {
+                        JsonObject extra = FrameCodec.readFrame(in);
+                        if (extra != null) {
+                            peer1ExtraFrame.countDown();
+                        }
+                    } catch (IOException ignored) {
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+
+            Thread peer2Thread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = peer2.accept();
+                        InputStream in = socket.getInputStream();
+                        OutputStream out = socket.getOutputStream()) {
+                    JsonObject req;
+                    while (!releasePeer2.await(0, TimeUnit.MILLISECONDS)
+                            && (req = FrameCodec.readFrame(in)) != null) {
+                        String id = req.get("id").getAsString();
+                        String op = req.get("op").getAsString();
+                        switch (op) {
+                            case RoomControlServer.OP_HELLO ->
+                                FrameCodec.writeFrame(out, buildHelloSuccess(id, "s-new-2", "Kasun"));
+                            case RoomControlServer.OP_JOIN -> {
+                                String roomId = req.getAsJsonObject("data").get("roomId").getAsString();
+                                FrameCodec.writeFrame(out, buildJoinSuccess(id, "s-new-2", roomId, 1L));
+                            }
+                            case RoomControlServer.OP_PING -> {
+                                peer2PingCount.incrementAndGet();
+                                FrameCodec.writeFrame(out, buildPongSuccessForSession(id, "s-new-2"));
+                            }
+                            case RoomControlServer.OP_QUIT -> {
+                                FrameCodec.writeFrame(out, buildByeSuccess(id));
+                                return;
+                            }
+                            default -> throw new AssertionError("Unexpected op on peer2: " + op);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+
+            ExecutorService attempt1Exec = Executors.newSingleThreadExecutor();
+            try {
+                // Start first connect attempt; peer1 reads HELLO and holds its reply
+                Future<SessionInfo> attempt1Future = attempt1Exec.submit(
+                        () -> client.connect("127.0.0.1", peer1.getLocalPort(), "Amal"));
+                assertTrue(peer1HelloReceived.await(2, TimeUnit.SECONDS));
+
+                // Complete second connect attempt on the same RoomClient while attempt 1's HELLO reply is still held
+                SessionInfo session2 = client.connect("127.0.0.1", peer2.getLocalPort(), "Kasun");
+                assertEquals(new SessionInfo("s-new-2", "Kasun"), session2);
+                assertTrue(client.isConnected());
+                assertEquals(Optional.of(session2), client.sessionInfo());
+                RoomBinding session2Binding = client.joinRoom("netprog");
+                assertEquals(new RoomBinding("s-new-2", "netprog", 1L), session2Binding);
+
+                // Release first connect attempt's delayed HELLO reply
+                releasePeer1Reply.countDown();
+
+                ExecutionException attempt1Ex = assertThrows(
+                        ExecutionException.class,
+                        () -> attempt1Future.get(2, TimeUnit.SECONDS),
+                        "Superseded first connect attempt must fail and never overwrite the newer session");
+                assertTrue(attempt1Ex.getCause() instanceof RoomClientException);
+
+                // Verify the newer session and its RoomBinding remain intact and usable
+                assertTrue(client.isConnected());
+                assertEquals(Optional.of(session2), client.sessionInfo());
+                assertEquals(Optional.of(session2Binding), client.currentBinding());
+                assertTrue(client.ping());
+                assertTrue(peer2PingCount.get() >= 1);
+                assertFalse(
+                        peer1ExtraFrame.await(120, TimeUnit.MILLISECONDS),
+                        "Superseded attempt 1 must not start a heartbeat");
+            } finally {
+                releasePeer1Reply.countDown();
+                releasePeer2.countDown();
+                attempt1Exec.shutdownNow();
+                peer1Thread.join(2_000);
+            }
+            peer2Thread.join(2_000);
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void overlappingJoinAndLeaveCommitLocalBindingInServerAcceptedOrder() throws Exception {
+        CountDownLatch joinSentByPeer = new CountDownLatch(1);
+        CountDownLatch leaveCompleted = new CountDownLatch(1);
+        CountDownLatch releaseServerClose = new CountDownLatch(1);
+        List<String> serverObservedOrder = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        try (ServerSocket peer = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"));
+                RoomClient client = new RoomClient(StudyLinkConfig.srsDefaults(), 3_000, false)) {
+            Thread peerThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = peer.accept();
+                        InputStream in = socket.getInputStream();
+                        OutputStream out = socket.getOutputStream()) {
+                    long rev = 0L;
+                    String activeRoom = null;
+                    JsonObject req;
+                    while ((req = FrameCodec.readFrame(in)) != null) {
+                        String id = req.get("id").getAsString();
+                        String op = req.get("op").getAsString();
+                        serverObservedOrder.add(op);
+                        switch (op) {
+                            case RoomControlServer.OP_HELLO ->
+                                FrameCodec.writeFrame(out, buildHelloSuccess(id, "s-0001", "Amal"));
+                            case RoomControlServer.OP_JOIN -> {
+                                activeRoom = req.getAsJsonObject("data").get("roomId").getAsString();
+                                rev++;
+                                FrameCodec.writeFrame(out, buildJoinSuccess(id, "s-0001", activeRoom, rev));
+                                joinSentByPeer.countDown();
+                            }
+                            case RoomControlServer.OP_LEAVE -> {
+                                JsonObject data = new JsonObject();
+                                data.addProperty("sessionId", "s-0001");
+                                if (activeRoom != null) {
+                                    data.addProperty("leftRoomId", activeRoom);
+                                } else {
+                                    data.add("leftRoomId", com.google.gson.JsonNull.INSTANCE);
+                                }
+                                activeRoom = null;
+                                FrameCodec.writeFrame(out, buildSuccess(id, data));
+                            }
+                            case RoomControlServer.OP_QUIT -> {
+                                FrameCodec.writeFrame(out, buildByeSuccess(id));
+                                return;
+                            }
+                            default -> throw new AssertionError("Unexpected op: " + op);
+                        }
+                    }
+                    releaseServerClose.await(2, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+            });
+
+            client.connect("127.0.0.1", peer.getLocalPort(), "Amal");
+
+            // Pause JOIN thread right after executeExchange reads the JOIN response if exchangeLock
+            // is not held across state commit, allowing LEAVE to run and commit currentBinding = null first.
+            CountDownLatch joinHookEntered = new CountDownLatch(1);
+            client.setAfterExchangeEnvelopeTestHook(op -> {
+                if (RoomClient.OP_JOIN.equals(op)) {
+                    joinHookEntered.countDown();
+                    try {
+                        // If LEAVE is able to execute while JOIN is at this hook, exchangeLock was released too early!
+                        leaveCompleted.await(150, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+
+            ExecutorService exec = Executors.newFixedThreadPool(2);
+            try {
+                Future<RoomBinding> joinFuture = exec.submit(() -> client.joinRoom("netprog"));
+                assertTrue(joinSentByPeer.await(2, TimeUnit.SECONDS));
+                assertTrue(joinHookEntered.await(2, TimeUnit.SECONDS));
+
+                Future<Optional<String>> leaveFuture = exec.submit(() -> {
+                    try {
+                        return client.leaveRoom();
+                    } finally {
+                        leaveCompleted.countDown();
+                    }
+                });
+
+                RoomBinding joinedBinding = joinFuture.get(2, TimeUnit.SECONDS);
+                Optional<String> leftRoom = leaveFuture.get(2, TimeUnit.SECONDS);
+
+                assertEquals(new RoomBinding("s-0001", "netprog", 1L), joinedBinding);
+                assertEquals(Optional.of("netprog"), leftRoom);
+                assertEquals(
+                        List.of(RoomControlServer.OP_HELLO, RoomControlServer.OP_JOIN, RoomControlServer.OP_LEAVE),
+                        serverObservedOrder);
+                // Because JOIN was accepted first and LEAVE second, the final client binding MUST be empty.
+                assertEquals(
+                        Optional.empty(),
+                        client.currentBinding(),
+                        "A late JOIN completion must not restore a RoomBinding after a later LEAVE");
+            } finally {
+                releaseServerClose.countDown();
+                exec.shutdownNow();
+            }
+            peerThread.join(2_000);
+        }
+    }
+
     private static StudyLinkConfig configWithTimers(int pingIntervalMs, int expiryMs) {
         StudyLinkConfig d = StudyLinkConfig.srsDefaults();
         return new StudyLinkConfig(
@@ -613,8 +923,12 @@ class RoomClientTest {
     }
 
     private static JsonObject buildPongSuccess(String id) {
+        return buildPongSuccessForSession(id, "s-0001");
+    }
+
+    private static JsonObject buildPongSuccessForSession(String id, String sessionId) {
         JsonObject data = new JsonObject();
-        data.addProperty("sessionId", "s-0001");
+        data.addProperty("sessionId", sessionId);
         data.addProperty("pong", true);
         return buildSuccess(id, data);
     }

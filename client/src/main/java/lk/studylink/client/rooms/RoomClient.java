@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -22,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
 import lk.studylink.shared.model.RoomDefinition;
@@ -36,23 +39,27 @@ import lk.studylink.shared.protocol.ProtocolConstants;
  * <ul>
  *   <li>Each connection attempt creates an isolated generation object with its own fair
  *       {@link ReentrantLock} ({@code exchangeLock}), request counter, and background heartbeat
- *       scheduler.</li>
+ *       scheduler, and registers ownership in {@code activeConnection} before performing any
+ *       blocking {@link Socket#connect} or {@code HELLO} I/O.</li>
  *   <li>Every control exchange ({@code HELLO}, {@code LIST_ROOMS}, {@code JOIN}, {@code LEAVE},
  *       {@code PING}, {@code QUIT}), including background heartbeats, acquires {@code exchangeLock}
- *       around the full {@code [writeFrame -> readFrame -> validate]} sequence so a background
- *       {@code PING} and a user action can never interleave frames or consume each other's reply.</li>
- *   <li>Automatic {@code PING} heartbeats start only after {@code HELLO} succeeds and are cancelled
- *       immediately on {@link #close()}, transport failure, or reconnect. Because each timer task is
- *       pinned to its specific connection generation, a delayed callback from an older generation
- *       can never send on, clear, or close a newer connection.</li>
+ *       around the full {@code [writeFrame -> readFrame -> validate -> commit local state]} sequence
+ *       so a background {@code PING} and a user action can never interleave frames, consume each
+ *       other's reply, or apply {@code JOIN}/{@code LEAVE} binding mutations out of order.</li>
+ *   <li>Automatic {@code PING} heartbeats start only after {@code HELLO} succeeds on the latest
+ *       still-current attempt and are cancelled immediately on {@link #close()}, transport failure,
+ *       or reconnect. Because each attempt is pinned to its specific connection generation, a
+ *       delayed reply, failure, or timer callback from an older generation can never publish a
+ *       session, replace, or close a newer connection.</li>
  *   <li>A correlated server rejection on {@code JOIN} (such as {@code UNKNOWN_ROOM}) throws
  *       {@link RoomClientException} with the server error code while preserving the previous valid
  *       {@link RoomBinding}.</li>
  *   <li>On EOF, read timeout, malformed frame, mismatched response {@code id}, invalid protocol
  *       version {@code v}, or missing required payload fields, the affected connection and its local
  *       {@link RoomBinding} are immediately invalidated and the underlying {@link Socket} is closed.</li>
- *   <li>Calling {@link #close()} closes the active {@link Socket} even if another thread is blocked
- *       waiting for a server reply, immediately unblocking that reader.</li>
+ *   <li>Calling {@link #close()} cancels any pending or established connection attempt and closes
+ *       its {@link Socket} immediately without holding a lifecycle lock across blocking I/O,
+ *       unblocking any thread waiting in {@code connect}/{@code HELLO} or a control exchange.</li>
  * </ul>
  *
  * <h2>M2 Discovery Handoff</h2>
@@ -83,6 +90,8 @@ public final class RoomClient implements AutoCloseable {
 
     private final AtomicLong generationSequence = new AtomicLong(1L);
     private final AtomicReference<ActiveConnection> activeConnection = new AtomicReference<>();
+    private final Set<ActiveConnection> trackedConnections = ConcurrentHashMap.newKeySet();
+    private volatile Consumer<String> afterExchangeEnvelopeTestHook;
 
     /**
      * Creates a client using SRS baseline defaults ({@code 3,000 ms} connect timeout,
@@ -162,7 +171,7 @@ public final class RoomClient implements AutoCloseable {
      * @param displayName desired student display name
      * @return established {@link SessionInfo}
      * @throws RoomClientException if {@code HELLO} is rejected (e.g. {@code NAME_IN_USE},
-     *                             {@code INVALID_NAME}) or the response is invalid
+     *                             {@code INVALID_NAME}), cancelled, superseded, or invalid
      * @throws IOException         if connecting or socket I/O fails
      */
     public SessionInfo connect(String host, int controlPort, String displayName) throws IOException {
@@ -182,79 +191,93 @@ public final class RoomClient implements AutoCloseable {
      * records the returned {@link SessionInfo} and {@link AdvertisedServicePorts}, and starts
      * automatic {@code PING} heartbeats (if enabled).
      *
-     * <p>If this {@code RoomClient} already holds an open connection, the previous connection and
-     * its heartbeat timer are closed before opening the new connection.
+     * <p>Ownership of the new attempt is recorded before any blocking {@link Socket#connect} or
+     * {@code HELLO} exchange begins. If this {@code RoomClient} already holds an established
+     * connection, that previous connection and its heartbeat timer are closed without affecting
+     * the new attempt. Any older still-pending attempt is superseded and can never overwrite or
+     * close the newer session when its delayed reply arrives.
      *
      * @param endpoint    target server control address (must not be {@code null})
      * @param displayName desired student display name (must not be {@code null})
      * @return established {@link SessionInfo}
      * @throws RoomClientException if {@code HELLO} is rejected (e.g. {@code NAME_IN_USE},
-     *                             {@code INVALID_NAME}) or the response violates Protocol v1
+     *                             {@code INVALID_NAME}), cancelled by {@link #close()}, superseded
+     *                             by a newer {@code connect(...)}, or the response violates Protocol v1
      * @throws IOException         if opening the socket fails
      */
     public SessionInfo connect(InetSocketAddress endpoint, String displayName) throws IOException {
         Objects.requireNonNull(endpoint, "endpoint must not be null");
         Objects.requireNonNull(displayName, "displayName must not be null");
 
-        // Close any previous connection on this client instance before starting a new session
-        close();
-
         long generation = generationSequence.getAndIncrement();
         Socket socket = new Socket();
+        ActiveConnection candidate = new ActiveConnection(generation, endpoint, socket);
+        trackedConnections.add(candidate);
+
+        ActiveConnection previous = activeConnection.getAndSet(candidate);
+        if (previous != null && previous != candidate && previous.established.get()) {
+            closeSpecificConnection(previous, true);
+        }
+
         try {
+            if (!isCurrentAttempt(candidate)) {
+                throw new RoomClientException("Control connection attempt was cancelled or superseded", true);
+            }
             socket.connect(endpoint, connectTimeoutMs);
             socket.setSoTimeout(readTimeoutMs);
             socket.setTcpNoDelay(true);
+            candidate.initStreams(socket.getInputStream(), socket.getOutputStream());
+            if (!isCurrentAttempt(candidate)) {
+                throw new RoomClientException("Control connection attempt was cancelled or superseded", true);
+            }
+        } catch (RoomClientException e) {
+            cleanupAttempt(candidate);
+            throw e;
         } catch (IOException e) {
-            closeQuietly(socket);
+            cleanupAttempt(candidate);
             throw new RoomClientException("Failed to connect to " + endpoint + ": " + e.getMessage(), e, true);
-        }
-
-        final ActiveConnection candidate;
-        try {
-            candidate = new ActiveConnection(
-                    generation,
-                    endpoint,
-                    socket,
-                    socket.getInputStream(),
-                    socket.getOutputStream()
-            );
-        } catch (IOException e) {
-            closeQuietly(socket);
-            throw new RoomClientException("Failed to initialize streams for " + endpoint, e, true);
         }
 
         JsonObject helloData = new JsonObject();
         helloData.addProperty("displayName", displayName);
 
-        final JsonObject responseData;
+        final SessionInfo establishedSession;
         try {
-            responseData = executeExchange(candidate, OP_HELLO, helloData, false);
+            establishedSession = executeExchange(candidate, OP_HELLO, helloData, false, responseData -> {
+                SessionInfo parsedSession = parseHelloSessionInfo(responseData);
+                AdvertisedServicePorts parsedPorts = parseHelloPorts(responseData);
+                if (!isCurrentAttempt(candidate)) {
+                    throw new RoomClientException(
+                            "Control connection attempt was cancelled or superseded during HELLO",
+                            true
+                    );
+                }
+                candidate.sessionInfo = parsedSession;
+                candidate.advertisedPorts = parsedPorts;
+                candidate.established.set(true);
+                if (!isCurrentAttempt(candidate)) {
+                    candidate.established.set(false);
+                    throw new RoomClientException(
+                            "Control connection attempt was cancelled or superseded during HELLO",
+                            true
+                    );
+                }
+                return parsedSession;
+            });
         } catch (RoomClientException e) {
-            candidate.invalidateAndCloseSocket();
+            cleanupAttempt(candidate);
             throw e;
-        }
-
-        SessionInfo establishedSession;
-        AdvertisedServicePorts ports;
-        try {
-            establishedSession = parseHelloSessionInfo(responseData);
-            ports = parseHelloPorts(responseData);
-        } catch (RoomClientException e) {
-            candidate.invalidateAndCloseSocket();
-            throw e;
-        }
-
-        candidate.sessionInfo = establishedSession;
-        candidate.advertisedPorts = ports;
-
-        ActiveConnection previous = activeConnection.getAndSet(candidate);
-        if (previous != null && previous != candidate) {
-            previous.invalidateAndCloseSocket();
         }
 
         if (autoPingEnabled && pingIntervalMs > 0) {
             candidate.startAutoPing(this, pingIntervalMs);
+        }
+        if (!isCurrentAttempt(candidate)) {
+            cleanupAttempt(candidate);
+            throw new RoomClientException(
+                    "Control connection attempt was cancelled or superseded after HELLO",
+                    true
+            );
         }
 
         return establishedSession;
@@ -268,36 +291,36 @@ public final class RoomClient implements AutoCloseable {
      */
     public List<RoomDefinition> listRooms() throws IOException {
         ActiveConnection conn = requireActiveConnection();
-        JsonObject data = executeExchange(conn, OP_LIST_ROOMS, new JsonObject(), true);
-
-        if (!data.has("rooms") || !data.get("rooms").isJsonArray()) {
-            invalidateConnection(conn);
-            throw new RoomClientException("LIST_ROOMS response missing 'rooms' array", true);
-        }
-
-        JsonArray roomsArray = data.getAsJsonArray("rooms");
-        List<RoomDefinition> rooms = new ArrayList<>(roomsArray.size());
-        for (JsonElement element : roomsArray) {
-            if (element == null || !element.isJsonObject()) {
+        return executeExchange(conn, OP_LIST_ROOMS, new JsonObject(), true, data -> {
+            if (!data.has("rooms") || !data.get("rooms").isJsonArray()) {
                 invalidateConnection(conn);
-                throw new RoomClientException("LIST_ROOMS entry is not a JSON object", true);
+                throw new RoomClientException("LIST_ROOMS response missing 'rooms' array", true);
             }
-            JsonObject roomObj = element.getAsJsonObject();
-            String id = extractNonBlankString(roomObj, "id");
-            String name = extractNonBlankString(roomObj, "name");
-            if (id == null || name == null) {
-                invalidateConnection(conn);
-                throw new RoomClientException("LIST_ROOMS entry missing non-blank 'id' or 'name'", true);
-            }
-            rooms.add(new RoomDefinition(id, name));
-        }
 
-        return List.copyOf(rooms);
+            JsonArray roomsArray = data.getAsJsonArray("rooms");
+            List<RoomDefinition> rooms = new ArrayList<>(roomsArray.size());
+            for (JsonElement element : roomsArray) {
+                if (element == null || !element.isJsonObject()) {
+                    invalidateConnection(conn);
+                    throw new RoomClientException("LIST_ROOMS entry is not a JSON object", true);
+                }
+                JsonObject roomObj = element.getAsJsonObject();
+                String id = extractNonBlankString(roomObj, "id");
+                String name = extractNonBlankString(roomObj, "name");
+                if (id == null || name == null) {
+                    invalidateConnection(conn);
+                    throw new RoomClientException("LIST_ROOMS entry missing non-blank 'id' or 'name'", true);
+                }
+                rooms.add(new RoomDefinition(id, name));
+            }
+
+            return List.copyOf(rooms);
+        });
     }
 
     /**
      * Joins or switches to {@code roomId} via {@code JOIN}, replacing the client's current
-     * {@link RoomBinding} on success.
+     * {@link RoomBinding} on success while still holding the connection's serialized exchange lock.
      *
      * <p>If the server rejects the request (for example with {@code UNKNOWN_ROOM}), throws
      * {@link RoomClientException} carrying that error code and preserves the previous valid
@@ -314,25 +337,26 @@ public final class RoomClient implements AutoCloseable {
         JsonObject reqData = new JsonObject();
         reqData.addProperty("roomId", roomId);
 
-        JsonObject respData = executeExchange(conn, OP_JOIN, reqData, true);
-        String respSessionId = extractNonBlankString(respData, "sessionId");
-        String respRoomId = extractNonBlankString(respData, "roomId");
-        Long revision = extractPositiveLong(respData, "revision");
+        return executeExchange(conn, OP_JOIN, reqData, true, respData -> {
+            String respSessionId = extractNonBlankString(respData, "sessionId");
+            String respRoomId = extractNonBlankString(respData, "roomId");
+            Long revision = extractPositiveLong(respData, "revision");
 
-        SessionInfo session = conn.sessionInfo;
-        if (respSessionId == null
-                || respRoomId == null
-                || revision == null
-                || session == null
-                || !session.sessionId().equals(respSessionId)
-                || !roomId.trim().equals(respRoomId)) {
-            invalidateConnection(conn);
-            throw new RoomClientException("Malformed JOIN response data from server", true);
-        }
+            SessionInfo session = conn.sessionInfo;
+            if (respSessionId == null
+                    || respRoomId == null
+                    || revision == null
+                    || session == null
+                    || !session.sessionId().equals(respSessionId)
+                    || !roomId.trim().equals(respRoomId)) {
+                invalidateConnection(conn);
+                throw new RoomClientException("Malformed JOIN response data from server", true);
+            }
 
-        RoomBinding newBinding = new RoomBinding(respSessionId, respRoomId, revision);
-        conn.currentBinding = newBinding;
-        return newBinding;
+            RoomBinding newBinding = new RoomBinding(respSessionId, respRoomId, revision);
+            conn.currentBinding = newBinding;
+            return newBinding;
+        });
     }
 
     /**
@@ -343,8 +367,8 @@ public final class RoomClient implements AutoCloseable {
     }
 
     /**
-     * Leaves the current room via {@code LEAVE}, clearing the local {@link RoomBinding} while
-     * keeping the session and display name active.
+     * Leaves the current room via {@code LEAVE}, clearing the local {@link RoomBinding} under
+     * the connection's serialized exchange lock while keeping the session and display name active.
      *
      * @return the room ID that was left, or {@link Optional#empty()} if the session was already
      *         outside all rooms
@@ -352,26 +376,26 @@ public final class RoomClient implements AutoCloseable {
      */
     public Optional<String> leave() throws IOException {
         ActiveConnection conn = requireActiveConnection();
-        JsonObject respData = executeExchange(conn, OP_LEAVE, new JsonObject(), true);
-
-        String respSessionId = extractNonBlankString(respData, "sessionId");
-        SessionInfo session = conn.sessionInfo;
-        if (respSessionId == null || session == null || !session.sessionId().equals(respSessionId)) {
-            invalidateConnection(conn);
-            throw new RoomClientException("Malformed LEAVE response: missing or mismatched sessionId", true);
-        }
-
-        String leftRoomId = null;
-        if (respData.has("leftRoomId") && !respData.get("leftRoomId").isJsonNull()) {
-            leftRoomId = extractNonBlankString(respData, "leftRoomId");
-            if (leftRoomId == null) {
+        return executeExchange(conn, OP_LEAVE, new JsonObject(), true, respData -> {
+            String respSessionId = extractNonBlankString(respData, "sessionId");
+            SessionInfo session = conn.sessionInfo;
+            if (respSessionId == null || session == null || !session.sessionId().equals(respSessionId)) {
                 invalidateConnection(conn);
-                throw new RoomClientException("Malformed LEAVE response: invalid leftRoomId", true);
+                throw new RoomClientException("Malformed LEAVE response: missing or mismatched sessionId", true);
             }
-        }
 
-        conn.currentBinding = null;
-        return Optional.ofNullable(leftRoomId);
+            String leftRoomId = null;
+            if (respData.has("leftRoomId") && !respData.get("leftRoomId").isJsonNull()) {
+                leftRoomId = extractNonBlankString(respData, "leftRoomId");
+                if (leftRoomId == null) {
+                    invalidateConnection(conn);
+                    throw new RoomClientException("Malformed LEAVE response: invalid leftRoomId", true);
+                }
+            }
+
+            conn.currentBinding = null;
+            return Optional.ofNullable(leftRoomId);
+        });
     }
 
     /**
@@ -395,51 +419,31 @@ public final class RoomClient implements AutoCloseable {
     }
 
     /**
-     * Cancels automatic heartbeats, sends a best-effort {@code QUIT} frame if the connection is
-     * idle and healthy, and closes the underlying TCP socket (unblocking any thread waiting for
+     * Cancels any pending or established connection attempts, stops automatic heartbeats, sends a
+     * best-effort {@code QUIT} frame if an established connection is idle and healthy, and closes
+     * the underlying TCP socket (unblocking any thread waiting in {@code connect}/{@code HELLO} or
      * a server reply). Safe and idempotent to call multiple times.
      */
     @Override
     public void close() {
-        ActiveConnection conn = activeConnection.getAndSet(null);
-        if (conn == null) {
-            return;
+        ActiveConnection current = activeConnection.getAndSet(null);
+        if (current != null) {
+            closeSpecificConnection(current, true);
         }
-
-        conn.cancelAutoPing();
-
-        if (!conn.invalidated.get() && !conn.socket.isClosed()) {
-            boolean locked = false;
-            try {
-                locked = conn.exchangeLock.tryLock(QUIT_LOCK_WAIT_MS, TimeUnit.MILLISECONDS);
-                if (locked && !conn.invalidated.get() && !conn.socket.isClosed()) {
-                    conn.socket.setSoTimeout(Math.min(readTimeoutMs, QUIT_READ_TIMEOUT_MS));
-                    String reqId = conn.nextRequestId();
-                    JsonObject quitReq = buildRequestEnvelope(reqId, OP_QUIT, new JsonObject());
-                    FrameCodec.writeFrame(conn.out, quitReq);
-                    FrameCodec.readFrame(conn.in);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (IOException ignored) {
-                // Best-effort QUIT handshake before closing socket
-            } finally {
-                conn.invalidateAndCloseSocket();
-                if (locked) {
-                    conn.exchangeLock.unlock();
-                }
+        for (ActiveConnection tracked : trackedConnections) {
+            if (tracked != current) {
+                closeSpecificConnection(tracked, false);
             }
-        } else {
-            conn.invalidateAndCloseSocket();
         }
     }
 
     /**
-     * Returns {@code true} if this client currently holds a live, non-invalidated control connection.
+     * Returns {@code true} if this client currently holds a live, established, non-invalidated
+     * control connection.
      */
     public boolean isConnected() {
         ActiveConnection conn = activeConnection.get();
-        return conn != null && conn.isOpen();
+        return conn != null && conn.isEstablishedAndOpen() && activeConnection.get() == conn;
     }
 
     /**
@@ -448,7 +452,7 @@ public final class RoomClient implements AutoCloseable {
      */
     public Optional<SessionInfo> sessionInfo() {
         ActiveConnection conn = activeConnection.get();
-        return (conn != null && conn.isOpen())
+        return (conn != null && conn.isEstablishedAndOpen() && activeConnection.get() == conn)
                 ? Optional.ofNullable(conn.sessionInfo)
                 : Optional.empty();
     }
@@ -459,7 +463,7 @@ public final class RoomClient implements AutoCloseable {
      */
     public Optional<AdvertisedServicePorts> advertisedPorts() {
         ActiveConnection conn = activeConnection.get();
-        return (conn != null && conn.isOpen())
+        return (conn != null && conn.isEstablishedAndOpen() && activeConnection.get() == conn)
                 ? Optional.ofNullable(conn.advertisedPorts)
                 : Optional.empty();
     }
@@ -477,7 +481,7 @@ public final class RoomClient implements AutoCloseable {
      */
     public Optional<RoomBinding> currentBinding() {
         ActiveConnection conn = activeConnection.get();
-        return (conn != null && conn.isOpen())
+        return (conn != null && conn.isEstablishedAndOpen() && activeConnection.get() == conn)
                 ? Optional.ofNullable(conn.currentBinding)
                 : Optional.empty();
     }
@@ -488,7 +492,7 @@ public final class RoomClient implements AutoCloseable {
      */
     public Optional<InetSocketAddress> remoteEndpoint() {
         ActiveConnection conn = activeConnection.get();
-        return (conn != null && conn.isOpen())
+        return (conn != null && conn.isEstablishedAndOpen() && activeConnection.get() == conn)
                 ? Optional.of(conn.endpoint)
                 : Optional.empty();
     }
@@ -517,23 +521,35 @@ public final class RoomClient implements AutoCloseable {
         return currentConnectionGeneration();
     }
 
+    /**
+     * Package-private test hook invoked inside {@code executeExchange} after the response envelope
+     * has been read and validated and before the operation's state change is committed or
+     * {@code exchangeLock} is released.
+     */
+    void setAfterExchangeEnvelopeTestHook(Consumer<String> hook) {
+        this.afterExchangeEnvelopeTestHook = hook;
+    }
+
     private void pingOnConnection(ActiveConnection conn) throws RoomClientException {
-        JsonObject respData = executeExchange(conn, OP_PING, new JsonObject(), true);
-        String respSessionId = extractNonBlankString(respData, "sessionId");
-        Boolean pong = extractBoolean(respData, "pong");
-        SessionInfo session = conn.sessionInfo;
-        if (respSessionId == null
-                || pong == null
-                || !pong
-                || session == null
-                || !session.sessionId().equals(respSessionId)) {
-            invalidateConnection(conn);
-            throw new RoomClientException("Malformed PING response from server", true);
-        }
+        executeExchange(conn, OP_PING, new JsonObject(), true, respData -> {
+            String respSessionId = extractNonBlankString(respData, "sessionId");
+            Boolean pong = extractBoolean(respData, "pong");
+            SessionInfo session = conn.sessionInfo;
+            if (respSessionId == null
+                    || pong == null
+                    || !pong
+                    || session == null
+                    || !session.sessionId().equals(respSessionId)) {
+                invalidateConnection(conn);
+                throw new RoomClientException("Malformed PING response from server", true);
+            }
+            return Boolean.TRUE;
+        });
     }
 
     private void runScheduledPing(ActiveConnection conn) {
-        if (conn.invalidated.get() || activeConnection.get() != conn) {
+        if (!isCurrentAttempt(conn) || !conn.established.get()) {
+            conn.cancelAutoPing();
             return;
         }
         try {
@@ -545,17 +561,25 @@ public final class RoomClient implements AutoCloseable {
 
     private ActiveConnection requireActiveConnection() throws RoomClientException {
         ActiveConnection conn = activeConnection.get();
-        if (conn == null || !conn.isOpen()) {
+        if (conn == null || !conn.isEstablishedAndOpen() || activeConnection.get() != conn) {
             throw new RoomClientException("RoomClient is not connected", true);
         }
         return conn;
     }
 
-    private JsonObject executeExchange(
+    private boolean isCurrentAttempt(ActiveConnection conn) {
+        return conn != null
+                && !conn.invalidated.get()
+                && !conn.socket.isClosed()
+                && activeConnection.get() == conn;
+    }
+
+    private <T> T executeExchange(
             ActiveConnection conn,
             String op,
             JsonObject requestData,
-            boolean requireActiveRegistration
+            boolean requireEstablished,
+            ResponseProcessor<T> processor
     ) throws RoomClientException {
         conn.exchangeLock.lock();
         try {
@@ -563,9 +587,20 @@ public final class RoomClient implements AutoCloseable {
                 invalidateConnection(conn);
                 throw new RoomClientException("Control connection is closed or invalidated", true);
             }
-            if (requireActiveRegistration && activeConnection.get() != conn) {
-                conn.invalidateAndCloseSocket();
+            if (activeConnection.get() != conn) {
+                cleanupAttempt(conn);
                 throw new RoomClientException("Control connection has been superseded", true);
+            }
+            if (requireEstablished && !conn.established.get()) {
+                invalidateConnection(conn);
+                throw new RoomClientException("Control connection has not completed HELLO", true);
+            }
+
+            InputStream in = conn.in;
+            OutputStream out = conn.out;
+            if (in == null || out == null) {
+                invalidateConnection(conn);
+                throw new RoomClientException("Control connection streams are not initialized", true);
             }
 
             String requestId = conn.nextRequestId();
@@ -574,13 +609,21 @@ public final class RoomClient implements AutoCloseable {
             final JsonObject responseEnvelope;
             try {
                 conn.socket.setSoTimeout(readTimeoutMs);
-                FrameCodec.writeFrame(conn.out, requestEnvelope);
-                responseEnvelope = FrameCodec.readFrame(conn.in);
+                FrameCodec.writeFrame(out, requestEnvelope);
+                responseEnvelope = FrameCodec.readFrame(in);
             } catch (IOException e) {
                 invalidateConnection(conn);
                 throw new RoomClientException(
                         "Control transport failure during " + op + ": " + e.getMessage(),
                         e,
+                        true
+                );
+            }
+
+            if (!isCurrentAttempt(conn)) {
+                cleanupAttempt(conn);
+                throw new RoomClientException(
+                        "Control connection was closed or superseded during " + op,
                         true
                 );
             }
@@ -650,18 +693,72 @@ public final class RoomClient implements AutoCloseable {
                         true
                 );
             }
-            return responseEnvelope.getAsJsonObject("data");
+
+            Consumer<String> hook = this.afterExchangeEnvelopeTestHook;
+            if (hook != null) {
+                hook.accept(op);
+            }
+
+            return processor.process(responseEnvelope.getAsJsonObject("data"));
         } finally {
             conn.exchangeLock.unlock();
         }
     }
 
-    private void invalidateConnection(ActiveConnection conn) {
+    private void closeSpecificConnection(ActiveConnection conn, boolean sendQuitIfEstablished) {
+        if (conn == null) {
+            return;
+        }
+        conn.cancelAutoPing();
+        try {
+            if (sendQuitIfEstablished
+                    && conn.established.get()
+                    && !conn.invalidated.get()
+                    && !conn.socket.isClosed()) {
+                boolean locked = false;
+                try {
+                    locked = conn.exchangeLock.tryLock(QUIT_LOCK_WAIT_MS, TimeUnit.MILLISECONDS);
+                    if (locked && conn.established.get() && !conn.invalidated.get() && !conn.socket.isClosed()) {
+                        InputStream in = conn.in;
+                        OutputStream out = conn.out;
+                        if (in != null && out != null) {
+                            conn.socket.setSoTimeout(Math.min(readTimeoutMs, QUIT_READ_TIMEOUT_MS));
+                            String reqId = conn.nextRequestId();
+                            JsonObject quitReq = buildRequestEnvelope(reqId, OP_QUIT, new JsonObject());
+                            FrameCodec.writeFrame(out, quitReq);
+                            FrameCodec.readFrame(in);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (IOException ignored) {
+                    // Best-effort QUIT handshake before closing socket
+                } finally {
+                    conn.invalidateAndCloseSocket();
+                    if (locked) {
+                        conn.exchangeLock.unlock();
+                    }
+                }
+            } else {
+                conn.invalidateAndCloseSocket();
+            }
+        } finally {
+            trackedConnections.remove(conn);
+            activeConnection.compareAndSet(conn, null);
+        }
+    }
+
+    private void cleanupAttempt(ActiveConnection conn) {
         if (conn == null) {
             return;
         }
         conn.invalidateAndCloseSocket();
+        trackedConnections.remove(conn);
         activeConnection.compareAndSet(conn, null);
+    }
+
+    private void invalidateConnection(ActiveConnection conn) {
+        cleanupAttempt(conn);
     }
 
     private static SessionInfo parseHelloSessionInfo(JsonObject data) throws RoomClientException {
@@ -797,16 +894,22 @@ public final class RoomClient implements AutoCloseable {
         }
     }
 
+    @FunctionalInterface
+    private interface ResponseProcessor<T> {
+        T process(JsonObject responseData) throws RoomClientException;
+    }
+
     private static final class ActiveConnection {
         private final long generation;
         private final InetSocketAddress endpoint;
         private final Socket socket;
-        private final InputStream in;
-        private final OutputStream out;
         private final ReentrantLock exchangeLock = new ReentrantLock(true);
         private final AtomicLong requestCounter = new AtomicLong(1L);
         private final AtomicBoolean invalidated = new AtomicBoolean(false);
+        private final AtomicBoolean established = new AtomicBoolean(false);
 
+        private volatile InputStream in;
+        private volatile OutputStream out;
         private volatile SessionInfo sessionInfo;
         private volatile AdvertisedServicePorts advertisedPorts;
         private volatile RoomBinding currentBinding;
@@ -816,13 +919,14 @@ public final class RoomClient implements AutoCloseable {
         private ActiveConnection(
                 long generation,
                 InetSocketAddress endpoint,
-                Socket socket,
-                InputStream in,
-                OutputStream out
+                Socket socket
         ) {
             this.generation = generation;
             this.endpoint = endpoint;
             this.socket = socket;
+        }
+
+        private void initStreams(InputStream in, OutputStream out) {
             this.in = in;
             this.out = out;
         }
@@ -831,12 +935,12 @@ public final class RoomClient implements AutoCloseable {
             return "c" + generation + "-r" + requestCounter.getAndIncrement();
         }
 
-        private boolean isOpen() {
-            return !invalidated.get() && !socket.isClosed();
+        private boolean isEstablishedAndOpen() {
+            return established.get() && !invalidated.get() && !socket.isClosed();
         }
 
         private void startAutoPing(RoomClient owner, int intervalMs) {
-            if (invalidated.get()) {
+            if (invalidated.get() || !established.get() || !owner.isCurrentAttempt(this)) {
                 return;
             }
             ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -851,7 +955,7 @@ public final class RoomClient implements AutoCloseable {
                     intervalMs,
                     TimeUnit.MILLISECONDS
             );
-            if (invalidated.get()) {
+            if (invalidated.get() || !owner.isCurrentAttempt(this)) {
                 cancelAutoPing();
             }
         }
@@ -869,6 +973,7 @@ public final class RoomClient implements AutoCloseable {
 
         private void invalidateAndCloseSocket() {
             invalidated.set(true);
+            established.set(false);
             currentBinding = null;
             cancelAutoPing();
             closeQuietly(socket);
