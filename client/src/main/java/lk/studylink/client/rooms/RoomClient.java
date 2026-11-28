@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -24,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
@@ -82,6 +84,16 @@ public final class RoomClient implements AutoCloseable {
     private static final int QUIT_READ_TIMEOUT_MS = 500;
     private static final BigDecimal EXPECTED_PROTOCOL_VERSION =
             BigDecimal.valueOf(ProtocolConstants.PROTOCOL_VERSION);
+    private static final HostResolver DEFAULT_HOST_RESOLVER = InetAddress::getByName;
+    private static final BooleanSupplier NEVER_CANCELLED = () -> false;
+
+    /**
+     * Resolves a server hostname or IPv4 literal to an {@link InetAddress}.
+     */
+    @FunctionalInterface
+    public interface HostResolver {
+        InetAddress resolve(String host) throws IOException;
+    }
 
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
@@ -91,6 +103,7 @@ public final class RoomClient implements AutoCloseable {
     private final AtomicLong generationSequence = new AtomicLong(1L);
     private final AtomicReference<ActiveConnection> activeConnection = new AtomicReference<>();
     private final Set<ActiveConnection> trackedConnections = ConcurrentHashMap.newKeySet();
+    private volatile HostResolver hostResolver = DEFAULT_HOST_RESOLVER;
     private volatile Consumer<String> afterExchangeEnvelopeTestHook;
 
     /**
@@ -175,7 +188,27 @@ public final class RoomClient implements AutoCloseable {
      * @throws IOException         if connecting or socket I/O fails
      */
     public SessionInfo connect(String host, int controlPort, String displayName) throws IOException {
+        return connect(host, controlPort, displayName, NEVER_CANCELLED);
+    }
+
+    /**
+     * Connects to {@code host:controlPort} with an external cancellation check (such as UI disposal
+     * or generation supersession) that is evaluated before and after hostname resolution, socket
+     * connection, and the {@code HELLO} handshake.
+     *
+     * <p>Unlike constructing a resolved {@link InetSocketAddress} upfront, this method registers
+     * the connection attempt before resolving {@code host} so a concurrent {@link #close()} or
+     * UI disposal during DNS lookup cancels the attempt before any socket connection or
+     * {@code HELLO} frame is sent.
+     */
+    public SessionInfo connect(
+            String host,
+            int controlPort,
+            String displayName,
+            BooleanSupplier externalCancelCheck
+    ) throws IOException {
         Objects.requireNonNull(host, "host must not be null");
+        Objects.requireNonNull(externalCancelCheck, "externalCancelCheck must not be null");
         String trimmedHost = host.trim();
         if (trimmedHost.isEmpty()) {
             throw new IllegalArgumentException("host must not be blank");
@@ -183,7 +216,11 @@ public final class RoomClient implements AutoCloseable {
         if (controlPort < 1 || controlPort > 65_535) {
             throw new IllegalArgumentException("controlPort must be 1..65535, found " + controlPort);
         }
-        return connect(new InetSocketAddress(trimmedHost, controlPort), displayName);
+        return connect(
+                InetSocketAddress.createUnresolved(trimmedHost, controlPort),
+                displayName,
+                externalCancelCheck
+        );
     }
 
     /**
@@ -191,11 +228,11 @@ public final class RoomClient implements AutoCloseable {
      * records the returned {@link SessionInfo} and {@link AdvertisedServicePorts}, and starts
      * automatic {@code PING} heartbeats (if enabled).
      *
-     * <p>Ownership of the new attempt is recorded before any blocking {@link Socket#connect} or
-     * {@code HELLO} exchange begins. If this {@code RoomClient} already holds an established
-     * connection, that previous connection and its heartbeat timer are closed without affecting
-     * the new attempt. Any older still-pending attempt is superseded and can never overwrite or
-     * close the newer session when its delayed reply arrives.
+     * <p>Ownership of the new attempt is recorded before any blocking hostname resolution,
+     * {@link Socket#connect}, or {@code HELLO} exchange begins. If this {@code RoomClient} already
+     * holds an established connection, that previous connection and its heartbeat timer are closed
+     * without affecting the new attempt. Any older still-pending attempt is superseded and can
+     * never overwrite or close the newer session when its delayed reply arrives.
      *
      * @param endpoint    target server control address (must not be {@code null})
      * @param displayName desired student display name (must not be {@code null})
@@ -206,12 +243,25 @@ public final class RoomClient implements AutoCloseable {
      * @throws IOException         if opening the socket fails
      */
     public SessionInfo connect(InetSocketAddress endpoint, String displayName) throws IOException {
+        return connect(endpoint, displayName, NEVER_CANCELLED);
+    }
+
+    /**
+     * Connects to {@code endpoint} with an external cancellation check evaluated across hostname
+     * resolution, socket connect, and {@code HELLO}.
+     */
+    public SessionInfo connect(
+            InetSocketAddress endpoint,
+            String displayName,
+            BooleanSupplier externalCancelCheck
+    ) throws IOException {
         Objects.requireNonNull(endpoint, "endpoint must not be null");
         Objects.requireNonNull(displayName, "displayName must not be null");
+        Objects.requireNonNull(externalCancelCheck, "externalCancelCheck must not be null");
 
         long generation = generationSequence.getAndIncrement();
         Socket socket = new Socket();
-        ActiveConnection candidate = new ActiveConnection(generation, endpoint, socket);
+        ActiveConnection candidate = new ActiveConnection(generation, endpoint, socket, externalCancelCheck);
         trackedConnections.add(candidate);
 
         ActiveConnection previous = activeConnection.getAndSet(candidate);
@@ -223,7 +273,15 @@ public final class RoomClient implements AutoCloseable {
             if (!isCurrentAttempt(candidate)) {
                 throw new RoomClientException("Control connection attempt was cancelled or superseded", true);
             }
-            socket.connect(endpoint, connectTimeoutMs);
+            InetSocketAddress resolvedEndpoint = resolveEndpoint(endpoint);
+            candidate.endpoint = resolvedEndpoint;
+            if (!isCurrentAttempt(candidate)) {
+                throw new RoomClientException(
+                        "Control connection attempt was cancelled or superseded during hostname resolution",
+                        true
+                );
+            }
+            socket.connect(resolvedEndpoint, connectTimeoutMs);
             socket.setSoTimeout(readTimeoutMs);
             socket.setTcpNoDelay(true);
             candidate.initStreams(socket.getInputStream(), socket.getOutputStream());
@@ -522,12 +580,29 @@ public final class RoomClient implements AutoCloseable {
     }
 
     /**
+     * Installs a custom {@link HostResolver} (used by tests to coordinate hostname resolution
+     * timing deterministically; defaults to {@link InetAddress#getByName(String)}).
+     */
+    public void setHostResolver(HostResolver hostResolver) {
+        this.hostResolver = Objects.requireNonNull(hostResolver, "hostResolver must not be null");
+    }
+
+    /**
      * Package-private test hook invoked inside {@code executeExchange} after the response envelope
      * has been read and validated and before the operation's state change is committed or
      * {@code exchangeLock} is released.
      */
     void setAfterExchangeEnvelopeTestHook(Consumer<String> hook) {
         this.afterExchangeEnvelopeTestHook = hook;
+    }
+
+    private InetSocketAddress resolveEndpoint(InetSocketAddress endpoint) throws IOException {
+        HostResolver resolver = this.hostResolver;
+        if (endpoint.isUnresolved() || resolver != DEFAULT_HOST_RESOLVER) {
+            InetAddress resolvedAddress = resolver.resolve(endpoint.getHostString());
+            return new InetSocketAddress(resolvedAddress, endpoint.getPort());
+        }
+        return endpoint;
     }
 
     private void pingOnConnection(ActiveConnection conn) throws RoomClientException {
@@ -570,6 +645,7 @@ public final class RoomClient implements AutoCloseable {
     private boolean isCurrentAttempt(ActiveConnection conn) {
         return conn != null
                 && !conn.invalidated.get()
+                && !conn.isExternallyCancelled()
                 && !conn.socket.isClosed()
                 && activeConnection.get() == conn;
     }
@@ -901,8 +977,9 @@ public final class RoomClient implements AutoCloseable {
 
     private static final class ActiveConnection {
         private final long generation;
-        private final InetSocketAddress endpoint;
+        private volatile InetSocketAddress endpoint;
         private final Socket socket;
+        private final BooleanSupplier externalCancelCheck;
         private final ReentrantLock exchangeLock = new ReentrantLock(true);
         private final AtomicLong requestCounter = new AtomicLong(1L);
         private final AtomicBoolean invalidated = new AtomicBoolean(false);
@@ -919,11 +996,17 @@ public final class RoomClient implements AutoCloseable {
         private ActiveConnection(
                 long generation,
                 InetSocketAddress endpoint,
-                Socket socket
+                Socket socket,
+                BooleanSupplier externalCancelCheck
         ) {
             this.generation = generation;
             this.endpoint = endpoint;
             this.socket = socket;
+            this.externalCancelCheck = externalCancelCheck;
+        }
+
+        private boolean isExternallyCancelled() {
+            return externalCancelCheck != null && externalCancelCheck.getAsBoolean();
         }
 
         private void initStreams(InputStream in, OutputStream out) {
