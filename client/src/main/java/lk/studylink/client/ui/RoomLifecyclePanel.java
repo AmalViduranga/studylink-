@@ -183,14 +183,33 @@ public final class RoomLifecyclePanel extends JPanel {
 
             workerExecutor.execute(() -> {
                 recordNetworkThread();
+                if (disposed.get() || uiGeneration.get() != gen) {
+                    runOnEdt(() -> result.complete(Optional.empty()));
+                    return;
+                }
                 try {
-                    SessionInfo session = roomClient.connect(host, port, displayName);
+                    SessionInfo session = roomClient.connect(
+                            host,
+                            port,
+                            displayName,
+                            () -> disposed.get() || uiGeneration.get() != gen
+                    );
+                    if (disposed.get() || uiGeneration.get() != gen) {
+                        roomClient.close();
+                        runOnEdt(() -> result.complete(Optional.empty()));
+                        return;
+                    }
                     List<RoomDefinition> rooms;
                     try {
                         rooms = roomClient.listRooms();
                     } catch (IOException listEx) {
                         roomClient.close();
                         throw listEx;
+                    }
+                    if (disposed.get() || uiGeneration.get() != gen) {
+                        roomClient.close();
+                        runOnEdt(() -> result.complete(Optional.empty()));
+                        return;
                     }
                     AdvertisedServicePorts ports = roomClient.advertisedPorts().orElse(null);
 
@@ -205,6 +224,9 @@ public final class RoomLifecyclePanel extends JPanel {
                         result.complete(Optional.of(session));
                     });
                 } catch (IOException ex) {
+                    if (disposed.get()) {
+                        roomClient.close();
+                    }
                     runOnEdt(() -> {
                         recordUiUpdateThread();
                         if (disposed.get() || uiGeneration.get() != gen) {
@@ -487,7 +509,7 @@ public final class RoomLifecyclePanel extends JPanel {
                 recordNetworkThread();
                 roomClient.close();
             } finally {
-                workerExecutor.shutdownNow();
+                workerExecutor.shutdown();
             }
         }, "studylink-rooms-ui-cleanup");
         cleanupThread.setDaemon(false);

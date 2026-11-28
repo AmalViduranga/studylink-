@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
+import lk.studylink.client.rooms.RoomClient;
 import lk.studylink.server.rooms.RoomControlServer;
 import lk.studylink.server.rooms.RoomSessionRegistry;
 import lk.studylink.shared.config.StudyLinkConfig;
@@ -447,6 +448,129 @@ class RoomLifecyclePanelTest {
                     panel.dispose();
                 }
                 peerThread.join(2_000);
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void disposingWindowDuringHostnameResolutionReturnsPromptlyOnEdtEstablishesNoSessionAndAllowsImmediateSameNameConnect()
+            throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults();
+        RoomSessionRegistry registry = new RoomSessionRegistry(config);
+        CountDownLatch resolutionStarted = new CountDownLatch(1);
+        CountDownLatch releaseResolution = new CountDownLatch(1);
+
+        try (RoomControlServer server = new RoomControlServer("127.0.0.1", 0, config, registry)) {
+            server.start();
+
+            RoomClient delayedResolverClient = new RoomClient(config);
+            delayedResolverClient.setHostResolver(host -> {
+                resolutionStarted.countDown();
+                while (true) {
+                    try {
+                        if (!releaseResolution.await(5, TimeUnit.SECONDS)) {
+                            throw new IOException("Timed out waiting for hostname resolution release");
+                        }
+                        break;
+                    } catch (InterruptedException e) {
+                        // Wait deterministically until the test explicitly releases hostname resolution
+                    }
+                }
+                return InetAddress.getByName("127.0.0.1");
+            });
+
+            AtomicReference<StarterFrame> frameRef = new AtomicReference<>();
+            AtomicReference<RoomLifecyclePanel> panelRef = new AtomicReference<>();
+            boolean hasDisplay = !GraphicsEnvironment.isHeadless();
+
+            SwingUtilities.invokeAndWait(() -> {
+                if (hasDisplay) {
+                    StarterFrame frame = new StarterFrame(
+                            config,
+                            "delayed-dns-dispose-test",
+                            delayedResolverClient
+                    );
+                    frameRef.set(frame);
+                    panelRef.set(frame.roomLifecyclePanel());
+                } else {
+                    panelRef.set(new RoomLifecyclePanel(config, delayedResolverClient));
+                }
+                RoomLifecyclePanel panel = panelRef.get();
+                panel.hostField().setText("studylink-host.local");
+                panel.portField().setText(Integer.toString(server.boundPort()));
+                panel.displayNameField().setText("Amal");
+            });
+
+            RoomLifecyclePanel disposedPanel = panelRef.get();
+            RoomLifecyclePanel freshPanel = createPanelOnEdt(config);
+
+            try {
+                CompletableFuture<Optional<SessionInfo>> pendingConnect = disposedPanel.connectAsync();
+                assertTrue(
+                        resolutionStarted.await(3, TimeUnit.SECONDS),
+                        "Background worker must enter hostname resolution"
+                );
+
+                // Dispose on the EDT while hostname resolution is still held, and verify a follow-up EDT event runs
+                CountDownLatch followUpEdtRan = new CountDownLatch(1);
+                AtomicLong edtDisposeElapsedMs = new AtomicLong(-1L);
+                long startNanos = System.nanoTime();
+
+                SwingUtilities.invokeLater(() -> {
+                    long t0 = System.nanoTime();
+                    if (hasDisplay) {
+                        frameRef.get().dispose();
+                    } else {
+                        disposedPanel.dispose();
+                    }
+                    edtDisposeElapsedMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0));
+                });
+                SwingUtilities.invokeLater(followUpEdtRan::countDown);
+
+                assertTrue(
+                        followUpEdtRan.await(300, TimeUnit.MILLISECONDS),
+                        "Follow-up EDT event must run promptly while hostname resolution is held"
+                );
+                long turnaroundMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                assertTrue(
+                        edtDisposeElapsedMs.get() >= 0L && turnaroundMs < 300L,
+                        "EDT disposal took too long: " + edtDisposeElapsedMs.get() + " ms"
+                );
+
+                // Now release hostname resolution after disposal has completed
+                releaseResolution.countDown();
+
+                // Pending future must finish with Optional.empty() without establishing a server session
+                assertEquals(Optional.empty(), pendingConnect.get(3, TimeUnit.SECONDS));
+                assertFalse(
+                        delayedResolverClient.isConnected(),
+                        "Disposed RoomClient must not hold an open socket or heartbeat"
+                );
+                assertEquals(
+                        0,
+                        server.activeConnectionCount(),
+                        "Server must have zero active connections from the disposed client"
+                );
+
+                // A fresh client must immediately succeed in connecting with the same display name "Amal"
+                SwingUtilities.invokeAndWait(() -> {
+                    freshPanel.hostField().setText("127.0.0.1");
+                    freshPanel.portField().setText(Integer.toString(server.boundPort()));
+                    freshPanel.displayNameField().setText("Amal");
+                });
+                SessionInfo freshSession = freshPanel.connectAsync().get(5, TimeUnit.SECONDS).orElseThrow();
+                assertEquals("Amal", freshSession.displayName());
+                assertTrue(freshSession.sessionId().startsWith("s-"));
+                assertTrue(freshPanel.isConnectedInUi());
+            } finally {
+                releaseResolution.countDown();
+                freshPanel.dispose();
+                if (hasDisplay && frameRef.get() != null) {
+                    SwingUtilities.invokeAndWait(frameRef.get()::dispose);
+                } else {
+                    disposedPanel.dispose();
+                }
             }
         }
     }
