@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
 import lk.studylink.client.rooms.RoomClient;
+import lk.studylink.server.chat.ChatServer;
 import lk.studylink.server.rooms.RoomControlServer;
 import lk.studylink.server.rooms.RoomSessionRegistry;
 import lk.studylink.shared.config.StudyLinkConfig;
@@ -573,6 +574,227 @@ class RoomLifecyclePanelTest {
                 }
             }
         }
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void roomAndChatPanelsCoordinateHelloPortHandoffJoinSwitchRejectedSwitchLeaveDisconnectReconnectAndDispose()
+            throws Exception {
+        StudyLinkConfig clientInitialConfig = StudyLinkConfig.srsDefaults();
+        RoomSessionRegistry registry = new RoomSessionRegistry(clientInitialConfig);
+
+        try (ChatServer chatServer = new ChatServer("127.0.0.1", 0, clientInitialConfig, registry)) {
+            chatServer.start();
+            int actualChatPort = chatServer.boundPort();
+            assertNotEquals(
+                    clientInitialConfig.chatPort(),
+                    actualChatPort,
+                    "Ephemeral ChatServer port must differ from default 45402 so HELLO port handoff is exercised"
+            );
+
+            StudyLinkConfig serverConfig = configWithChatPort(clientInitialConfig, actualChatPort);
+            try (RoomControlServer roomServer = new RoomControlServer("127.0.0.1", 0, serverConfig, registry)) {
+                roomServer.start();
+
+                AtomicReference<ChatPanel> amalChatRef = new AtomicReference<>();
+                AtomicReference<RoomLifecyclePanel> amalRoomRef = new AtomicReference<>();
+                AtomicReference<ChatPanel> kasunChatRef = new AtomicReference<>();
+                AtomicReference<RoomLifecyclePanel> kasunRoomRef = new AtomicReference<>();
+
+                SwingUtilities.invokeAndWait(() -> {
+                    ChatPanel amalChat = new ChatPanel(clientInitialConfig);
+                    RoomLifecyclePanel amalRoom = new RoomLifecyclePanel(
+                            clientInitialConfig,
+                            new RoomClient(clientInitialConfig),
+                            amalChat
+                    );
+                    amalRoom.hostField().setText("127.0.0.1");
+                    amalRoom.portField().setText(Integer.toString(roomServer.boundPort()));
+                    amalRoom.displayNameField().setText("Amal");
+                    amalChatRef.set(amalChat);
+                    amalRoomRef.set(amalRoom);
+
+                    ChatPanel kasunChat = new ChatPanel(clientInitialConfig);
+                    RoomLifecyclePanel kasunRoom = new RoomLifecyclePanel(
+                            clientInitialConfig,
+                            new RoomClient(clientInitialConfig),
+                            kasunChat
+                    );
+                    kasunRoom.hostField().setText("127.0.0.1");
+                    kasunRoom.portField().setText(Integer.toString(roomServer.boundPort()));
+                    kasunRoom.displayNameField().setText("Kasun");
+                    kasunChatRef.set(kasunChat);
+                    kasunRoomRef.set(kasunRoom);
+                });
+
+                ChatPanel amalChat = amalChatRef.get();
+                RoomLifecyclePanel amalRoom = amalRoomRef.get();
+                ChatPanel kasunChat = kasunChatRef.get();
+                RoomLifecyclePanel kasunRoom = kasunRoomRef.get();
+
+                try {
+                    // 1. Connect both panels: HELLO must update each ChatClient's endpoint to actualChatPort
+                    SessionInfo amalSession1 = amalRoom.connectAsync().get(5, TimeUnit.SECONDS).orElseThrow();
+                    SessionInfo kasunSession1 = kasunRoom.connectAsync().get(5, TimeUnit.SECONDS).orElseThrow();
+                    assertEquals(actualChatPort, amalChat.chatClient().port());
+                    assertEquals(actualChatPort, kasunChat.chatClient().port());
+                    assertFalse(amalChat.isSubscribed());
+                    assertFalse(kasunChat.isSubscribed());
+
+                    // 2. Both join "netprog" (rev 1) -> ChatPanels automatically subscribe and receive messages
+                    RoomBinding amalNetprog =
+                            amalRoom.joinRoomAsync("netprog").get(5, TimeUnit.SECONDS).orElseThrow();
+                    RoomBinding kasunNetprog =
+                            kasunRoom.joinRoomAsync("netprog").get(5, TimeUnit.SECONDS).orElseThrow();
+                    assertEquals(new RoomBinding(amalSession1.sessionId(), "netprog", 1L), amalNetprog);
+                    assertEquals(new RoomBinding(kasunSession1.sessionId(), "netprog", 1L), kasunNetprog);
+                    assertTrue(awaitCondition(amalChat::isSubscribed, 3_000));
+                    assertTrue(awaitCondition(kasunChat::isSubscribed, 3_000));
+
+                    sendChatOnEdt(amalChat, "msg1-before-rejected-switch");
+                    assertTrue(awaitTranscriptContains(amalChat, "Amal: msg1-before-rejected-switch", 3_000));
+                    assertTrue(awaitTranscriptContains(kasunChat, "Amal: msg1-before-rejected-switch", 3_000));
+
+                    // 3. Rejected switch to "unknown-room" must leave Amal's existing "netprog" chat subscription usable
+                    Optional<RoomBinding> afterRejected =
+                            amalRoom.joinRoomAsync("unknown-room").get(5, TimeUnit.SECONDS);
+                    assertEquals(Optional.of(amalNetprog), afterRejected);
+                    assertTrue(amalChat.isSubscribed(), "Rejected room switch must not unsubscribe active room chat");
+                    assertEquals(amalNetprog, amalChat.activeBinding());
+
+                    sendChatOnEdt(amalChat, "msg2-after-rejected-switch");
+                    assertTrue(awaitTranscriptContains(amalChat, "Amal: msg2-after-rejected-switch", 3_000));
+                    assertTrue(awaitTranscriptContains(kasunChat, "Amal: msg2-after-rejected-switch", 3_000));
+
+                    // 4. Kasun switches to "revision" (rev 2) -> clears netprog transcript and isolates rooms
+                    RoomBinding kasunRevision =
+                            kasunRoom.joinRoomAsync("revision").get(5, TimeUnit.SECONDS).orElseThrow();
+                    assertEquals(new RoomBinding(kasunSession1.sessionId(), "revision", 2L), kasunRevision);
+                    assertTrue(awaitCondition(
+                            () -> kasunChat.isSubscribed()
+                                    && kasunRevision.equals(kasunChat.activeBinding()),
+                            3_000
+                    ));
+                    SwingUtilities.invokeAndWait(
+                            () -> assertEquals("", kasunChat.transcriptText(), "Room switch must clear prior transcript")
+                    );
+
+                    sendChatOnEdt(amalChat, "msg3-only-netprog");
+                    assertTrue(awaitTranscriptContains(amalChat, "Amal: msg3-only-netprog", 3_000));
+                    sendChatOnEdt(kasunChat, "msg4-only-revision");
+                    assertTrue(awaitTranscriptContains(kasunChat, "Kasun: msg4-only-revision", 3_000));
+
+                    SwingUtilities.invokeAndWait(() -> {
+                        assertFalse(
+                                kasunChat.transcriptText().contains("msg3-only-netprog"),
+                                "Kasun in revision must not receive netprog messages after switch"
+                        );
+                        assertFalse(
+                                amalChat.transcriptText().contains("msg4-only-revision"),
+                                "Amal in netprog must not receive revision messages"
+                        );
+                    });
+
+                    // 5. Amal leaves room -> ChatPanel unsubscribes and disables controls
+                    assertEquals(
+                            Optional.of("netprog"),
+                            amalRoom.leaveRoomAsync().get(5, TimeUnit.SECONDS)
+                    );
+                    assertTrue(awaitCondition(() -> !amalChat.isSubscribed(), 3_000));
+                    SwingUtilities.invokeAndWait(() -> {
+                        assertEquals(null, amalChat.activeBinding());
+                        assertFalse(amalChat.sendButton().isEnabled());
+                    });
+
+                    // 6. Amal disconnects, reconnects, and joins "revision" -> ChatPanel re-subscribes and chats with Kasun
+                    amalRoom.disconnectAsync().get(5, TimeUnit.SECONDS);
+                    assertFalse(amalChat.isSubscribed());
+
+                    SessionInfo amalSession2 = amalRoom.connectAsync().get(5, TimeUnit.SECONDS).orElseThrow();
+                    assertNotEquals(amalSession1.sessionId(), amalSession2.sessionId());
+                    RoomBinding amalRevision =
+                            amalRoom.joinRoomAsync("revision").get(5, TimeUnit.SECONDS).orElseThrow();
+                    assertTrue(awaitCondition(
+                            () -> amalChat.isSubscribed()
+                                    && amalRevision.equals(amalChat.activeBinding()),
+                            3_000
+                    ));
+
+                    sendChatOnEdt(amalChat, "msg5-reconnected-in-revision");
+                    assertTrue(awaitTranscriptContains(amalChat, "Amal: msg5-reconnected-in-revision", 3_000));
+                    assertTrue(awaitTranscriptContains(kasunChat, "Amal: msg5-reconnected-in-revision", 3_000));
+                } finally {
+                    amalRoom.dispose();
+                    kasunRoom.dispose();
+                    assertTrue(awaitCondition(() -> !amalChat.isSubscribed() && !kasunChat.isSubscribed(), 3_000));
+                }
+            }
+        }
+    }
+
+    private static void sendChatOnEdt(ChatPanel chatPanel, String text) throws Exception {
+        SwingUtilities.invokeAndWait(() -> {
+            chatPanel.messageField().setText(text);
+            chatPanel.sendButton().doClick();
+        });
+    }
+
+    private static boolean awaitTranscriptContains(ChatPanel chatPanel, String expectedToken, long timeoutMs)
+            throws Exception {
+        return awaitCondition(() -> {
+            AtomicReference<String> transcript = new AtomicReference<>("");
+            try {
+                SwingUtilities.invokeAndWait(() -> transcript.set(chatPanel.transcriptText()));
+            } catch (Exception ignored) {
+            }
+            return transcript.get().contains(expectedToken);
+        }, timeoutMs);
+    }
+
+    private static boolean awaitCondition(java.util.function.BooleanSupplier condition, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            Thread.sleep(20L);
+        }
+        return condition.getAsBoolean();
+    }
+
+    private static StudyLinkConfig configWithChatPort(StudyLinkConfig base, int chatPort) {
+        return new StudyLinkConfig(
+                base.serverId(),
+                base.serverHost(),
+                base.networkInterface(),
+                base.discoveryPort(),
+                base.roomsPort(),
+                chatPort,
+                base.filesPort(),
+                base.notesPort(),
+                base.dataDir(),
+                base.tlsProtocol(),
+                base.tlsServerStore(),
+                base.tlsClientTrustStore(),
+                base.rooms(),
+                base.maxFrameBytes(),
+                base.maxUdpBytes(),
+                base.maxChatTextBytes(),
+                base.maxNoteTextBytes(),
+                base.maxFileSizeBytes(),
+                base.fileWorkerThreads(),
+                base.fileQueueCapacity(),
+                base.maxSlowClientQueueBytes(),
+                base.maxInboxNotesPerRoom(),
+                base.maxFilesPerRoom(),
+                base.discoveryTimeoutMs(),
+                base.heartbeatIntervalMs(),
+                base.presenceExpiryMs(),
+                base.presenceHideMs(),
+                base.controlPingIntervalMs(),
+                base.controlSessionExpiryMs()
+        );
     }
 
     private static RoomLifecyclePanel createPanelOnEdt(StudyLinkConfig config) throws Exception {

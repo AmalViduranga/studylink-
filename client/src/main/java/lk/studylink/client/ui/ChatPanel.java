@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -28,7 +29,8 @@ import lk.studylink.shared.model.RoomBinding;
 import lk.studylink.shared.model.RoomDefinition;
 
 /**
- * Swing Chat tab panel for Member 5 (SRS Section 2 Figure 1, Section 5.5, Q02, Q09).
+ * Swing Chat tab panel for Member 5 integrated with Member 1's room lifecycle
+ * (SRS Section 2 Figure 1, Section 5.5, F06, F07, Q02, Q03, Q09, T04).
  *
  * <p>All network operations run off the Swing Event Dispatch Thread via {@link ChatClient} on a
  * background executor, while every Swing model and widget update is marshaled onto the EDT with
@@ -44,6 +46,7 @@ public final class ChatPanel extends JPanel {
     private final int maxChatTextBytes;
     private final ExecutorService workerExecutor;
     private final AtomicLong activeUiGeneration = new AtomicLong(0L);
+    private final AtomicBoolean disposed = new AtomicBoolean(false);
 
     private final JLabel roomTitleLabel = new JLabel("No room joined");
     private final JLabel statusLabel = new JLabel("Disconnected");
@@ -86,81 +89,113 @@ public final class ChatPanel extends JPanel {
     }
 
     /**
+     * Updates the target chat server host and NIO port (from the active room-control connection
+     * host and the {@code chatNioTcp} port advertised by {@code HELLO}).
+     */
+    public void setChatEndpoint(String host, int port) {
+        chatClient.setEndpoint(host, port);
+    }
+
+    /**
      * Switches the Chat tab to {@code room} using {@code binding}, clearing any prior room
      * transcript and subscribing asynchronously off the EDT.
      */
     public void joinRoomChat(RoomDefinition room, RoomBinding binding) {
         Objects.requireNonNull(room, "room must not be null");
         Objects.requireNonNull(binding, "binding must not be null");
+        if (disposed.get()) {
+            return;
+        }
 
         long generation = activeUiGeneration.incrementAndGet();
         this.activeBinding = binding;
         this.subscribed = false;
 
         runOnEdt(() -> {
+            if (disposed.get() || activeUiGeneration.get() != generation) {
+                return;
+            }
             roomTitleLabel.setText(room.displayName() + " (" + room.id() + ")");
             transcriptArea.setText("");
             setStatus("Connecting to " + room.displayName() + "...", SUBTLE_TEXT_COLOR);
             updateControlsEnabled(false);
         });
 
-        workerExecutor.execute(() -> {
-            if (activeUiGeneration.get() != generation) {
-                return;
-            }
-            try {
-                chatClient.subscribe(binding, new ChatListener() {
-                    @Override
-                    public void onChatEvent(ChatEvent event) {
-                        runOnEdt(() -> {
-                            if (activeUiGeneration.get() == generation
-                                    && binding.equals(activeBinding)
-                                    && binding.roomId().equals(event.roomId())) {
-                                appendChatEventOnEdt(event);
-                            }
-                        });
+        try {
+            workerExecutor.execute(() -> {
+                if (disposed.get() || activeUiGeneration.get() != generation) {
+                    return;
+                }
+                try {
+                    chatClient.subscribe(binding, new ChatListener() {
+                        @Override
+                        public void onChatEvent(ChatEvent event) {
+                            runOnEdt(() -> {
+                                if (!disposed.get()
+                                        && activeUiGeneration.get() == generation
+                                        && binding.equals(activeBinding)
+                                        && binding.roomId().equals(event.roomId())) {
+                                    appendChatEventOnEdt(event);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onDisconnected(String reason) {
+                            runOnEdt(() -> {
+                                if (!disposed.get()
+                                        && activeUiGeneration.get() == generation
+                                        && binding.equals(activeBinding)) {
+                                    subscribed = false;
+                                    updateControlsEnabled(false);
+                                    setStatus("Disconnected: " + reason, ERROR_STATUS_COLOR);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onError(String errorCode, String message) {
+                            runOnEdt(() -> {
+                                if (!disposed.get()
+                                        && activeUiGeneration.get() == generation
+                                        && binding.equals(activeBinding)) {
+                                    setStatus("Chat error (" + errorCode + "): " + message, ERROR_STATUS_COLOR);
+                                }
+                            });
+                        }
+                    });
+
+                    if (disposed.get() || activeUiGeneration.get() != generation) {
+                        chatClient.unsubscribe();
+                        return;
                     }
 
-                    @Override
-                    public void onDisconnected(String reason) {
-                        runOnEdt(() -> {
-                            if (activeUiGeneration.get() == generation && binding.equals(activeBinding)) {
-                                subscribed = false;
-                                updateControlsEnabled(false);
-                                setStatus("Disconnected: " + reason, ERROR_STATUS_COLOR);
-                            }
-                        });
-                    }
-
-                    @Override
-                    public void onError(String errorCode, String message) {
-                        runOnEdt(() -> {
-                            if (activeUiGeneration.get() == generation && binding.equals(activeBinding)) {
-                                setStatus("Chat error (" + errorCode + "): " + message, ERROR_STATUS_COLOR);
-                            }
-                        });
-                    }
-                });
-
-                runOnEdt(() -> {
-                    if (activeUiGeneration.get() == generation && binding.equals(activeBinding)) {
-                        subscribed = true;
-                        setStatus("Connected to " + room.displayName(), OK_STATUS_COLOR);
-                        updateControlsEnabled(true);
-                        messageField.requestFocusInWindow();
-                    }
-                });
-            } catch (ChatException e) {
-                runOnEdt(() -> {
-                    if (activeUiGeneration.get() == generation && binding.equals(activeBinding)) {
-                        subscribed = false;
-                        updateControlsEnabled(false);
-                        setStatus("Failed to subscribe (" + e.errorCode() + "): " + e.getMessage(),
-                                ERROR_STATUS_COLOR);
-                    }
-                });
-            }
-        });
+                    runOnEdt(() -> {
+                        if (!disposed.get()
+                                && activeUiGeneration.get() == generation
+                                && binding.equals(activeBinding)) {
+                            subscribed = true;
+                            setStatus("Connected to " + room.displayName(), OK_STATUS_COLOR);
+                            updateControlsEnabled(true);
+                            messageField.requestFocusInWindow();
+                        }
+                    });
+                } catch (ChatException e) {
+                    runOnEdt(() -> {
+                        if (!disposed.get()
+                                && activeUiGeneration.get() == generation
+                                && binding.equals(activeBinding)) {
+                            subscribed = false;
+                            updateControlsEnabled(false);
+                            setStatus("Failed to subscribe (" + e.errorCode() + "): " + e.getMessage(),
+                                    ERROR_STATUS_COLOR);
+                        }
+                    });
+                }
+            });
+        } catch (RuntimeException ignoredAfterShutdown) {
+            // Worker executor already shut down during disposal
+        }
     }
 
     /**
@@ -172,6 +207,9 @@ public final class ChatPanel extends JPanel {
         this.subscribed = false;
 
         runOnEdt(() -> {
+            if (activeUiGeneration.get() != generation) {
+                return;
+            }
             roomTitleLabel.setText("No room joined");
             transcriptArea.setText("");
             messageField.setText("");
@@ -179,17 +217,27 @@ public final class ChatPanel extends JPanel {
             updateControlsEnabled(false);
         });
 
-        workerExecutor.execute(() -> {
-            if (activeUiGeneration.get() == generation) {
-                chatClient.unsubscribe();
-            }
-        });
+        if (disposed.get()) {
+            return;
+        }
+        try {
+            workerExecutor.execute(() -> {
+                if (!disposed.get() && activeUiGeneration.get() == generation) {
+                    chatClient.unsubscribe();
+                }
+            });
+        } catch (RuntimeException ignoredAfterShutdown) {
+            // Worker executor already shut down during disposal
+        }
     }
 
     /**
      * Sends the text currently entered in the compose field on a background worker thread.
      */
     public void sendCurrentInput() {
+        if (disposed.get()) {
+            return;
+        }
         String text = messageField.getText();
         if (text == null || text.isBlank()) {
             setStatus("Enter a non-empty message before sending.", ERROR_STATUS_COLOR);
@@ -210,27 +258,38 @@ public final class ChatPanel extends JPanel {
         }
 
         sendButton.setEnabled(false);
-        workerExecutor.execute(() -> {
-            try {
-                chatClient.send(text);
-                runOnEdt(() -> {
-                    if (activeUiGeneration.get() == generation && current.equals(activeBinding)) {
-                        messageField.setText("");
-                        setStatus("Connected", OK_STATUS_COLOR);
-                        updateControlsEnabled(subscribed);
-                        messageField.requestFocusInWindow();
-                    }
-                });
-            } catch (ChatException e) {
-                runOnEdt(() -> {
-                    if (activeUiGeneration.get() == generation && current.equals(activeBinding)) {
-                        setStatus("Send failed (" + e.errorCode() + "): " + e.getMessage(),
-                                ERROR_STATUS_COLOR);
-                        updateControlsEnabled(subscribed);
-                    }
-                });
-            }
-        });
+        try {
+            workerExecutor.execute(() -> {
+                if (disposed.get() || activeUiGeneration.get() != generation) {
+                    return;
+                }
+                try {
+                    chatClient.send(text);
+                    runOnEdt(() -> {
+                        if (!disposed.get()
+                                && activeUiGeneration.get() == generation
+                                && current.equals(activeBinding)) {
+                            messageField.setText("");
+                            setStatus("Connected", OK_STATUS_COLOR);
+                            updateControlsEnabled(subscribed);
+                            messageField.requestFocusInWindow();
+                        }
+                    });
+                } catch (ChatException e) {
+                    runOnEdt(() -> {
+                        if (!disposed.get()
+                                && activeUiGeneration.get() == generation
+                                && current.equals(activeBinding)) {
+                            setStatus("Send failed (" + e.errorCode() + "): " + e.getMessage(),
+                                    ERROR_STATUS_COLOR);
+                            updateControlsEnabled(subscribed);
+                        }
+                    });
+                }
+            });
+        } catch (RuntimeException ignoredAfterShutdown) {
+            // Worker executor already shut down during disposal
+        }
     }
 
     /**
@@ -248,14 +307,82 @@ public final class ChatPanel extends JPanel {
     }
 
     /**
-     * Closes the underlying {@link ChatClient} and background worker executor.
+     * Returns the current room title label text.
+     */
+    public String roomTitleText() {
+        return roomTitleLabel.getText();
+    }
+
+    /**
+     * Returns the current UTF-8 byte counter label text.
+     */
+    public String byteCounterText() {
+        return byteCounterLabel.getText();
+    }
+
+    /**
+     * Returns {@code true} if the panel currently holds an active room chat subscription.
+     */
+    public boolean isSubscribed() {
+        return subscribed && !disposed.get() && chatClient.isConnected();
+    }
+
+    /**
+     * Returns the active {@link RoomBinding} currently associated with this chat panel, or {@code null}.
+     */
+    public RoomBinding activeBinding() {
+        return activeBinding;
+    }
+
+    /**
+     * Returns the underlying {@link ChatClient}.
+     */
+    public ChatClient chatClient() {
+        return chatClient;
+    }
+
+    /**
+     * Returns the chat message compose text field.
+     */
+    public JTextField messageField() {
+        return messageField;
+    }
+
+    /**
+     * Returns the chat Send button.
+     */
+    public JButton sendButton() {
+        return sendButton;
+    }
+
+    /**
+     * Closes the underlying {@link ChatClient} and background worker executor off the Swing EDT.
+     * Safe and idempotent to call multiple times.
      */
     public void dispose() {
+        if (!disposed.compareAndSet(false, true)) {
+            return;
+        }
         activeUiGeneration.incrementAndGet();
         subscribed = false;
         activeBinding = null;
-        workerExecutor.shutdownNow();
-        chatClient.close();
+        runOnEdt(() -> {
+            roomTitleLabel.setText("No room joined");
+            transcriptArea.setText("");
+            messageField.setText("");
+            setStatus("Disconnected", SUBTLE_TEXT_COLOR);
+            updateControlsEnabled(false);
+        });
+
+        Thread cleanupThread = new Thread(() -> {
+            try {
+                chatClient.close();
+            } finally {
+                workerExecutor.shutdown();
+            }
+        }, "studylink-chat-ui-cleanup");
+        cleanupThread.setDaemon(false);
+        cleanupThread.start();
     }
 
     private void initializeLayout() {
@@ -276,7 +403,7 @@ public final class ChatPanel extends JPanel {
         transcriptArea.setWrapStyleWord(true);
         transcriptArea.getAccessibleContext().setAccessibleName("Live room chat transcript");
         JScrollPane scrollPane = new JScrollPane(transcriptArea);
-        scrollPane.setPreferredSize(new Dimension(520, 320));
+        scrollPane.setPreferredSize(new Dimension(520, 240));
         add(scrollPane, BorderLayout.CENTER);
 
         // Bottom: message input, UTF-8 byte counter, and Send button
@@ -322,15 +449,16 @@ public final class ChatPanel extends JPanel {
         int bytes = (text == null) ? 0 : text.getBytes(StandardCharsets.UTF_8).length;
         byteCounterLabel.setText(bytes + " / " + maxChatTextBytes + " B");
         byteCounterLabel.setForeground(bytes > maxChatTextBytes ? ERROR_STATUS_COLOR : SUBTLE_TEXT_COLOR);
-        updateControlsEnabled(subscribed);
+        updateControlsEnabled(subscribed && !disposed.get());
     }
 
     private void updateControlsEnabled(boolean isSubscribed) {
+        boolean canUse = isSubscribed && !disposed.get();
         String text = messageField.getText();
         int bytes = (text == null) ? 0 : text.getBytes(StandardCharsets.UTF_8).length;
         boolean hasValidText = text != null && !text.isBlank() && bytes <= maxChatTextBytes;
-        messageField.setEnabled(isSubscribed);
-        sendButton.setEnabled(isSubscribed && hasValidText);
+        messageField.setEnabled(canUse);
+        sendButton.setEnabled(canUse && hasValidText);
     }
 
     private void appendChatEventOnEdt(ChatEvent event) {

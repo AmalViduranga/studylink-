@@ -8,6 +8,7 @@ import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import lk.studylink.server.chat.ChatServer;
 import lk.studylink.server.rooms.RoomControlServer;
 import lk.studylink.server.rooms.RoomSessionRegistry;
 import lk.studylink.shared.config.CliOptions;
@@ -20,9 +21,11 @@ import lk.studylink.shared.model.FeatureServiceSpec;
  * Entry point for the StudyLink host server executable ({@code server/target/studylink-server.jar}).
  *
  * <p>Supports headless {@code --help} and {@code --config <path> --check-config} validation, and on
- * normal launch initializes the shared {@link RoomSessionRegistry}, binds and starts the blocking
- * TCP {@link RoomControlServer} on {@code server.host:port.rooms}, reports the listening endpoint,
- * keeps the server process alive until shutdown, and releases socket and worker resources cleanly.
+ * normal launch initializes the shared {@link RoomSessionRegistry}, binds and starts both the
+ * blocking TCP {@link RoomControlServer} ({@code server.host:port.rooms}) and the non-blocking NIO
+ * {@link ChatServer} ({@code server.host:port.chat}), reports both listening endpoints, rolls back
+ * cleanly if either listener fails to bind, keeps the server process alive until shutdown, and
+ * releases all sockets, channels, selectors, and worker resources on exit.
  */
 public final class ServerMain {
 
@@ -40,7 +43,8 @@ public final class ServerMain {
     }
 
     /**
-     * Executes the server CLI workflow and blocks while the TCP room-control service is running.
+     * Executes the server CLI workflow and blocks while the room-control and live room-chat
+     * services are running.
      *
      * @param args command-line arguments
      * @param out  standard output stream
@@ -54,7 +58,7 @@ public final class ServerMain {
 
     /**
      * Package-private overload allowing tests to observe the bound room-control address immediately
-     * after startup and trigger deterministic shutdown via {@code stopSignal}.
+     * after both services start and trigger deterministic shutdown via {@code stopSignal}.
      */
     static int run(
             String[] args,
@@ -112,23 +116,45 @@ public final class ServerMain {
         StudyLinkConfig config = loaded.config();
         RoomSessionRegistry registry = new RoomSessionRegistry(config);
         RoomControlServer roomControlServer = new RoomControlServer(config, registry);
+        ChatServer chatServer = new ChatServer(config, registry);
 
         try {
             roomControlServer.start();
         } catch (IOException e) {
             roomControlServer.close();
+            chatServer.close();
             err.println("[studylink-server] Failed to bind TCP room-control service on "
                     + config.serverHost() + ":" + config.roomsPort() + ": " + e.getMessage());
             err.flush();
             return 1;
         }
 
-        int boundPort = roomControlServer.boundPort();
-        String listeningEndpoint = config.serverHost() + ":" + boundPort;
+        try {
+            chatServer.start();
+        } catch (IOException e) {
+            try {
+                chatServer.close();
+            } finally {
+                roomControlServer.close();
+            }
+            err.println("[studylink-server] Failed to bind NIO live room-chat service on "
+                    + config.serverHost() + ":" + config.chatPort() + ": " + e.getMessage());
+            err.flush();
+            return 1;
+        }
+
+        int boundRoomsPort = roomControlServer.boundPort();
+        int boundChatPort = chatServer.boundPort();
+        String roomsEndpoint = config.serverHost() + ":" + boundRoomsPort;
+        String chatEndpoint = config.serverHost() + ":" + boundChatPort;
 
         Thread shutdownHook = new Thread(() -> {
             effectiveStopSignal.countDown();
-            roomControlServer.close();
+            try {
+                chatServer.close();
+            } finally {
+                roomControlServer.close();
+            }
         }, "studylink-server-shutdown-hook");
 
         boolean hookRegistered = false;
@@ -140,7 +166,7 @@ public final class ServerMain {
         }
 
         try {
-            printStartupBanner(out, loaded, config, listeningEndpoint);
+            printStartupBanner(out, loaded, config, roomsEndpoint, chatEndpoint);
             if (onListeningCallback != null) {
                 onListeningCallback.accept(roomControlServer.boundAddress());
             }
@@ -150,7 +176,11 @@ public final class ServerMain {
             Thread.currentThread().interrupt();
             return 0;
         } finally {
-            roomControlServer.close();
+            try {
+                chatServer.close();
+            } finally {
+                roomControlServer.close();
+            }
             if (hookRegistered) {
                 try {
                     Runtime.getRuntime().removeShutdownHook(shutdownHook);
@@ -158,7 +188,8 @@ public final class ServerMain {
                     // Shutdown is already in progress
                 }
             }
-            out.println("[studylink-server] TCP room-control service stopped (" + listeningEndpoint + ").");
+            out.println("[studylink-server] TCP room-control service stopped (" + roomsEndpoint + ").");
+            out.println("[studylink-server] NIO live room-chat service stopped (" + chatEndpoint + ").");
             out.flush();
         }
     }
@@ -167,7 +198,8 @@ public final class ServerMain {
             PrintStream out,
             ConfigLoader.LoadedConfig loaded,
             StudyLinkConfig config,
-            String listeningEndpoint
+            String roomsEndpoint,
+            String chatEndpoint
     ) {
         String roomsSummary = config.rooms().stream()
                 .map(r -> r.displayName() + " [" + r.id() + "]")
@@ -185,9 +217,11 @@ public final class ServerMain {
         out.println("------------------------------------------------------------------------");
         out.println("Network Service Listeners:");
         for (FeatureServiceSpec service : FeatureServiceSpec.plannedServices(config)) {
-            String status = "M1".equals(service.ownerCode())
-                    ? "LISTENING on " + listeningEndpoint
-                    : service.status();
+            String status = switch (service.ownerCode()) {
+                case "M1" -> "LISTENING on " + roomsEndpoint;
+                case "M5" -> "LISTENING on " + chatEndpoint;
+                default -> service.status();
+            };
             out.printf("  %-3s %-10s | port %-5d | %-39s | %s%n",
                     service.ownerCode(),
                     service.featureName(),
@@ -196,7 +230,8 @@ public final class ServerMain {
                     status);
         }
         out.println("------------------------------------------------------------------------");
-        out.println("[studylink-server] TCP room-control service listening on " + listeningEndpoint);
+        out.println("[studylink-server] TCP room-control service listening on " + roomsEndpoint);
+        out.println("[studylink-server] NIO live room-chat service listening on " + chatEndpoint);
         out.println("Press Ctrl+C to stop the server.");
         out.flush();
     }

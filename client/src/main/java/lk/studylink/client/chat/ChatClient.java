@@ -46,8 +46,8 @@ public final class ChatClient implements AutoCloseable {
     private static final long DEFAULT_OP_TIMEOUT_MS = 5_000L;
     private static final long CONNECT_TIMEOUT_MS = 5_000L;
 
-    private final String host;
-    private final int port;
+    private volatile String host;
+    private volatile int port;
     private final int maxFrameBytes;
     private final int maxChatTextBytes;
     private final AtomicLong requestCounter = new AtomicLong(0L);
@@ -103,6 +103,40 @@ public final class ChatClient implements AutoCloseable {
         this.port = port;
         this.maxFrameBytes = maxFrameBytes;
         this.maxChatTextBytes = maxChatTextBytes;
+    }
+
+    /**
+     * Updates the target chat server host and TCP NIO port used for subsequent
+     * {@link #subscribe(RoomBinding, ChatListener)} calls (for example, from the host and
+     * {@code chatNioTcp} port advertised by Member 1's {@code HELLO} handshake).
+     */
+    public void setEndpoint(String host, int port) {
+        Objects.requireNonNull(host, "host must not be null");
+        String trimmedHost = host.trim();
+        if (trimmedHost.isEmpty()) {
+            throw new IllegalArgumentException("host must not be blank");
+        }
+        if (port < 1 || port > 65_535) {
+            throw new IllegalArgumentException("port must be 1..65535, found " + port);
+        }
+        synchronized (lifecycleLock) {
+            this.host = trimmedHost;
+            this.port = port;
+        }
+    }
+
+    /**
+     * Returns the current target chat server hostname or IPv4 address.
+     */
+    public String host() {
+        return host;
+    }
+
+    /**
+     * Returns the current target chat server TCP NIO port.
+     */
+    public int port() {
+        return port;
     }
 
     /**

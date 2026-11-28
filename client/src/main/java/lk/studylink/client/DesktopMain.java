@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import lk.studylink.client.ui.ChatPanel;
 import lk.studylink.client.ui.RoomLifecyclePanel;
 import lk.studylink.client.ui.StarterFrame;
 import lk.studylink.shared.config.CliOptions;
@@ -18,7 +19,8 @@ import lk.studylink.shared.config.StudyLinkConfig;
  * Entry point for the StudyLink desktop client executable ({@code client/target/studylink-client.jar}).
  * Processes {@code --help} and {@code --check-config} headlessly before initializing AWT/Swing.
  * On normal launch with a desktop display, applies FlatLaf Light and opens {@link StarterFrame}
- * (with its interactive {@link RoomLifecyclePanel}) on Swing's Event Dispatch Thread.
+ * (with its interactive {@link RoomLifecyclePanel} and {@link ChatPanel}) on Swing's Event
+ * Dispatch Thread.
  */
 public final class DesktopMain {
 
@@ -57,7 +59,7 @@ public final class DesktopMain {
             out.print(CliOptions.formatUsage(
                     JAR_PATH,
                     DesktopMain.class.getName(),
-                    "Swing desktop client with FlatLaf Light and TCP Room Control"
+                    "Swing desktop client with FlatLaf Light, TCP Room Control, and Java NIO Chat"
             ));
             return 0;
         }
@@ -128,6 +130,7 @@ public final class DesktopMain {
 
     private static void executeDemoSteps(StarterFrame frame, String demoSteps, PrintStream out) {
         RoomLifecyclePanel panel = frame.roomLifecyclePanel();
+        ChatPanel chatPanel = frame.chatPanel();
         String[] steps = demoSteps.split(",");
         try {
             for (String rawStep : steps) {
@@ -150,10 +153,12 @@ public final class DesktopMain {
                 } else if (step.startsWith("join=")) {
                     String roomId = step.substring("join=".length());
                     panel.joinRoomAsync(roomId).get(5, TimeUnit.SECONDS);
+                    awaitChatSubscribed(chatPanel, 3_000L);
                     logUiSnapshot(panel, "AFTER_JOIN(" + roomId + ")", out);
                 } else if (step.startsWith("switch=")) {
                     String roomId = step.substring("switch=".length());
                     panel.joinRoomAsync(roomId).get(5, TimeUnit.SECONDS);
+                    awaitChatSubscribed(chatPanel, 3_000L);
                     logUiSnapshot(panel, "AFTER_SWITCH(" + roomId + ")", out);
                 } else if ("leave".equals(step)) {
                     panel.leaveRoomAsync().get(5, TimeUnit.SECONDS);
@@ -161,6 +166,36 @@ public final class DesktopMain {
                 } else if ("disconnect".equals(step)) {
                     panel.disconnectAsync().get(5, TimeUnit.SECONDS);
                     logUiSnapshot(panel, "AFTER_DISCONNECT", out);
+                } else if (step.startsWith("chatsend=")) {
+                    String text = step.substring("chatsend=".length());
+                    awaitChatSubscribed(chatPanel, 3_000L);
+                    SwingUtilities.invokeAndWait(() -> {
+                        chatPanel.messageField().setText(text);
+                        chatPanel.sendCurrentInput();
+                    });
+                    awaitChatTextInTranscript(chatPanel, text, 3_000L);
+                    logChatSnapshot(chatPanel, "AFTER_CHATSEND(" + text + ")", out);
+                } else if ("chatblank".equals(step)) {
+                    SwingUtilities.invokeAndWait(() -> {
+                        chatPanel.messageField().setText("   ");
+                        chatPanel.sendCurrentInput();
+                    });
+                    logChatSnapshot(chatPanel, "AFTER_CHAT_BLANK", out);
+                } else if ("chatover2048".equals(step)) {
+                    // 700 3-byte UTF-8 characters (Sinhala letter 'ආ' U+0D86) = 700 chars, 2,100 UTF-8 bytes (> 2,048 B)
+                    String multibyteOversized = "\u0D86".repeat(700);
+                    SwingUtilities.invokeAndWait(() -> {
+                        chatPanel.messageField().setText(multibyteOversized);
+                        chatPanel.sendCurrentInput();
+                    });
+                    logChatSnapshot(chatPanel, "AFTER_CHAT_MULTIBYTE_OVER_2048", out);
+                    SwingUtilities.invokeAndWait(() -> chatPanel.messageField().setText(""));
+                } else if (step.startsWith("waitchat=")) {
+                    String token = step.substring("waitchat=".length());
+                    awaitChatTextInTranscript(chatPanel, token, 5_000L);
+                } else if (step.startsWith("chatlog=")) {
+                    String label = step.substring("chatlog=".length());
+                    logChatSnapshot(chatPanel, label, out);
                 } else if (step.startsWith("pause=")) {
                     long ms = Long.parseLong(step.substring("pause=".length()));
                     Thread.sleep(ms);
@@ -174,6 +209,26 @@ public final class DesktopMain {
             out.println("[studylink-client-ui] DEMO_ERROR=" + e.getMessage());
             out.flush();
             SwingUtilities.invokeLater(frame::dispose);
+        }
+    }
+
+    private static void awaitChatSubscribed(ChatPanel chatPanel, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (!chatPanel.isSubscribed() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+    }
+
+    private static void awaitChatTextInTranscript(ChatPanel chatPanel, String expectedSubstring, long timeoutMs)
+            throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        String[] holder = new String[]{""};
+        while (System.nanoTime() < deadline) {
+            SwingUtilities.invokeAndWait(() -> holder[0] = chatPanel.transcriptText());
+            if (holder[0].contains(expectedSubstring)) {
+                return;
+            }
+            Thread.sleep(25);
         }
     }
 
@@ -192,6 +247,27 @@ public final class DesktopMain {
                     panel.statusBannerText(),
                     panel.lastNetworkIoRanOffEdt(),
                     panel.lastUiUpdateRanOnEdt()
+            );
+            out.flush();
+        });
+    }
+
+    private static void logChatSnapshot(ChatPanel chatPanel, String stepLabel, PrintStream out)
+            throws Exception {
+        SwingUtilities.invokeAndWait(() -> {
+            String rawTranscript = chatPanel.transcriptText().replace("\r", "").trim();
+            String singleLineTranscript = rawTranscript.isEmpty()
+                    ? "<EMPTY>"
+                    : rawTranscript.replace("\n", " || ");
+            out.printf(
+                    "[studylink-chat-ui] STEP=%s | roomTitle=\"%s\" | chatStatus=\"%s\" | "
+                            + "byteCounter=\"%s\" | sendEnabled=%s | transcript=\"%s\"%n",
+                    stepLabel,
+                    chatPanel.roomTitleText(),
+                    chatPanel.statusText(),
+                    chatPanel.byteCounterText(),
+                    chatPanel.sendButton().isEnabled(),
+                    singleLineTranscript
             );
             out.flush();
         });

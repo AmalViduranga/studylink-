@@ -93,6 +93,8 @@ public final class RoomLifecyclePanel extends JPanel {
 
     private final Timer livenessTimer;
 
+    private volatile ChatPanel chatPanel;
+    private String activeControlHost;
     private boolean connectedInUi = false;
     private boolean operationInFlight = false;
     private SessionInfo visibleSession = null;
@@ -106,7 +108,8 @@ public final class RoomLifecyclePanel extends JPanel {
     public RoomLifecyclePanel(StudyLinkConfig config) {
         this(
                 Objects.requireNonNull(config, "config must not be null"),
-                new RoomClient(config)
+                new RoomClient(config),
+                null
         );
     }
 
@@ -114,8 +117,17 @@ public final class RoomLifecyclePanel extends JPanel {
      * Creates a room lifecycle panel with an explicit {@link StudyLinkConfig} and {@link RoomClient}.
      */
     public RoomLifecyclePanel(StudyLinkConfig config, RoomClient roomClient) {
+        this(config, roomClient, null);
+    }
+
+    /**
+     * Creates a room lifecycle panel wired to a companion {@link ChatPanel}.
+     */
+    public RoomLifecyclePanel(StudyLinkConfig config, RoomClient roomClient, ChatPanel chatPanel) {
         this.config = Objects.requireNonNull(config, "config must not be null");
         this.roomClient = Objects.requireNonNull(roomClient, "roomClient must not be null");
+        this.chatPanel = chatPanel;
+        this.activeControlHost = config.serverHost();
         this.workerExecutor = Executors.newSingleThreadExecutor(runnable -> {
             Thread t = new Thread(runnable, "studylink-rooms-ui-worker");
             t.setDaemon(true);
@@ -128,6 +140,14 @@ public final class RoomLifecyclePanel extends JPanel {
 
         this.livenessTimer = new Timer(LIVENESS_POLL_MS, e -> pollConnectionLivenessOnEdt());
         this.livenessTimer.start();
+    }
+
+    /**
+     * Attaches or replaces the companion {@link ChatPanel} notified on room join, switch, leave,
+     * disconnect, connection loss, and window disposal.
+     */
+    public void bindChatPanel(ChatPanel chatPanel) {
+        this.chatPanel = chatPanel;
     }
 
     /**
@@ -364,6 +384,7 @@ public final class RoomLifecyclePanel extends JPanel {
                                 CONNECTED_COLOR
                         );
                         updateControlStatesOnEdt();
+                        notifyChatJoinedOnEdt(newBinding);
                         result.complete(Optional.of(newBinding));
                     });
                 } catch (IOException ex) {
@@ -427,6 +448,7 @@ public final class RoomLifecyclePanel extends JPanel {
                                 CONNECTED_COLOR
                         );
                         updateControlStatesOnEdt();
+                        notifyChatLeftOnEdt();
                         result.complete(leftRoomId);
                     });
                 } catch (IOException ex) {
@@ -495,6 +517,10 @@ public final class RoomLifecyclePanel extends JPanel {
         }
         uiGeneration.incrementAndGet();
         livenessTimer.stop();
+        ChatPanel panelToDispose = this.chatPanel;
+        if (panelToDispose != null) {
+            panelToDispose.dispose();
+        }
         runOnEdt(() -> {
             recordUiUpdateThread();
             operationInFlight = false;
@@ -782,9 +808,17 @@ public final class RoomLifecyclePanel extends JPanel {
             List<RoomDefinition> rooms
     ) {
         this.connectedInUi = true;
+        this.activeControlHost = host;
         this.visibleSession = session;
         this.visiblePorts = ports;
         this.visibleBinding = roomClient.currentBinding().orElse(null);
+
+        ChatPanel attachedChat = this.chatPanel;
+        if (attachedChat != null && !disposed.get()) {
+            int chatPort = (ports != null) ? ports.chatNioTcp() : config.chatPort();
+            attachedChat.setChatEndpoint(host, chatPort);
+            attachedChat.leaveRoomChat();
+        }
 
         connectionStateLabel.setText("Connected (" + host + ":" + port + ")");
         connectionStateLabel.setForeground(CONNECTED_COLOR);
@@ -831,6 +865,42 @@ public final class RoomLifecyclePanel extends JPanel {
 
         setStatusBannerOnEdt(bannerMessage, isError ? ERROR_COLOR : SUBTLE_COLOR);
         updateControlStatesOnEdt();
+        notifyChatLeftOnEdt();
+    }
+
+    private void notifyChatJoinedOnEdt(RoomBinding binding) {
+        ChatPanel attachedChat = this.chatPanel;
+        if (attachedChat == null || disposed.get() || binding == null) {
+            return;
+        }
+        String host = (activeControlHost != null && !activeControlHost.isBlank())
+                ? activeControlHost
+                : config.serverHost();
+        int chatPort = (visiblePorts != null) ? visiblePorts.chatNioTcp() : config.chatPort();
+        attachedChat.setChatEndpoint(host, chatPort);
+        RoomDefinition confirmedRoom = resolveRoomDefinition(binding.roomId());
+        attachedChat.joinRoomChat(confirmedRoom, binding);
+    }
+
+    private void notifyChatLeftOnEdt() {
+        ChatPanel attachedChat = this.chatPanel;
+        if (attachedChat != null && !disposed.get()) {
+            attachedChat.leaveRoomChat();
+        }
+    }
+
+    private RoomDefinition resolveRoomDefinition(String roomId) {
+        for (RoomDefinition room : visibleRooms) {
+            if (room.id().equals(roomId)) {
+                return room;
+            }
+        }
+        for (RoomDefinition room : config.rooms()) {
+            if (room.id().equals(roomId)) {
+                return room;
+            }
+        }
+        return new RoomDefinition(roomId, roomId);
     }
 
     private void handlePostConnectFailureOnEdt(String prefix, IOException ex) {

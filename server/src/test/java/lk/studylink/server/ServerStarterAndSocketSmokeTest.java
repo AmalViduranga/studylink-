@@ -37,6 +37,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import lk.studylink.shared.model.ChatEvent;
+import lk.studylink.shared.model.RoomBinding;
+import lk.studylink.shared.protocol.ChatProtocol;
 import lk.studylink.shared.protocol.FrameCodec;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -116,20 +119,23 @@ class ServerStarterAndSocketSmokeTest {
             throws Exception {
         int[] ports = reserveDistinctLoopbackPorts(5);
         int roomsPort = ports[1];
+        int chatPort = ports[2];
         Path configFile = writeTempConfigWithPorts("launcher-live.properties", ports);
-        String expectedEndpoint = "127.0.0.1:" + roomsPort;
+        String expectedRoomsEndpoint = "127.0.0.1:" + roomsPort;
+        String expectedChatEndpoint = "127.0.0.1:" + chatPort;
 
         ManagedServerProcess firstServer = startServerSubprocess(configFile);
         try {
             assertTrue(
-                    firstServer.awaitListening(expectedEndpoint, 8, TimeUnit.SECONDS),
-                    () -> "Expected server subprocess to report listening on " + expectedEndpoint
+                    firstServer.awaitListening(expectedRoomsEndpoint, expectedChatEndpoint, 8, TimeUnit.SECONDS),
+                    () -> "Expected server subprocess to report listening on " + expectedRoomsEndpoint
+                            + " and " + expectedChatEndpoint
                             + ", output was:\n" + firstServer.capturedOutput()
             );
             assertTrue(firstServer.process().isAlive(), "Server process must stay alive after startup");
 
-            // 1. Verify HELLO and LIST_ROOMS over a real loopback TCP socket
-            verifyHelloAndListRooms(roomsPort, "Amal");
+            // 1. Verify HELLO, LIST_ROOMS, JOIN, and live NIO chat over real loopback TCP sockets
+            verifyHelloListRoomsAndLiveChat(roomsPort, chatPort, "Amal");
 
             // 2. While firstServer is still holding roomsPort, a second launch on the same port must fail clearly
             ManagedServerProcess occupiedServer = startServerSubprocess(configFile);
@@ -146,8 +152,8 @@ class ServerStarterAndSocketSmokeTest {
                 );
                 String conflictOutput = occupiedServer.capturedOutput();
                 assertTrue(
-                        conflictOutput.contains("Failed to bind TCP room-control service on " + expectedEndpoint),
-                        () -> "Expected bind failure message mentioning " + expectedEndpoint
+                        conflictOutput.contains("Failed to bind TCP room-control service on " + expectedRoomsEndpoint),
+                        () -> "Expected bind failure message mentioning " + expectedRoomsEndpoint
                                 + ", got:\n" + conflictOutput
                 );
             } finally {
@@ -156,25 +162,26 @@ class ServerStarterAndSocketSmokeTest {
 
             // Original server must still be alive and serving requests after the failed second launch
             assertTrue(firstServer.process().isAlive());
-            verifyHelloAndListRooms(roomsPort, "Kasun");
+            verifyHelloListRoomsAndLiveChat(roomsPort, chatPort, "Kasun");
 
-            // 3. Stop firstServer and verify it terminates and releases roomsPort for reuse
+            // 3. Stop firstServer and verify it terminates and releases both roomsPort and chatPort for reuse
             firstServer.stopAndAwait(5, TimeUnit.SECONDS);
             assertFalse(firstServer.process().isAlive(), "First server process must have terminated");
         } finally {
             firstServer.close();
         }
 
-        // 4. Port reuse: launch a fresh server subprocess on the exact same config and roomsPort
+        // 4. Port reuse: launch a fresh server subprocess on the exact same config, roomsPort, and chatPort
         ManagedServerProcess reusedServer = startServerSubprocess(configFile);
         try {
             assertTrue(
-                    reusedServer.awaitListening(expectedEndpoint, 8, TimeUnit.SECONDS),
-                    () -> "Expected restarted server to bind reusable port " + expectedEndpoint
+                    reusedServer.awaitListening(expectedRoomsEndpoint, expectedChatEndpoint, 8, TimeUnit.SECONDS),
+                    () -> "Expected restarted server to bind reusable ports " + expectedRoomsEndpoint
+                            + " and " + expectedChatEndpoint
                             + ", output was:\n" + reusedServer.capturedOutput()
             );
             assertTrue(reusedServer.process().isAlive());
-            verifyHelloAndListRooms(roomsPort, "Nimal");
+            verifyHelloListRoomsAndLiveChat(roomsPort, chatPort, "Nimal");
             reusedServer.stopAndAwait(5, TimeUnit.SECONDS);
             assertFalse(reusedServer.process().isAlive());
         } finally {
@@ -183,12 +190,46 @@ class ServerStarterAndSocketSmokeTest {
     }
 
     @Test
-    @Timeout(value = 10, unit = TimeUnit.SECONDS)
-    void serverMainInProcessRunServesControlRequestsAndReleasesPortOnStopSignal() throws Exception {
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void serverMainInProcessRunServesControlRequestsRollsBackOccupiedChatPortAndReleasesPortsOnStopSignal()
+            throws Exception {
         int[] ports = reserveDistinctLoopbackPorts(5);
         int roomsPort = ports[1];
+        int chatPort = ports[2];
         Path configFile = writeTempConfigWithPorts("inprocess-live.properties", ports);
 
+        // 1. Pre-occupy chatPort while leaving roomsPort free: ServerMain must close RoomControlServer and return 1
+        try (ServerSocket occupiedChatSocket = new ServerSocket(
+                chatPort,
+                10,
+                InetAddress.getByName("127.0.0.1")
+        )) {
+            assertTrue(occupiedChatSocket.isBound());
+            ByteArrayOutputStream failOut = new ByteArrayOutputStream();
+            ByteArrayOutputStream failErr = new ByteArrayOutputStream();
+            int failCode = ServerMain.run(
+                    new String[]{"--config", configFile.toString()},
+                    new PrintStream(failOut, true, StandardCharsets.UTF_8),
+                    new PrintStream(failErr, true, StandardCharsets.UTF_8)
+            );
+            assertEquals(1, failCode, "Partial startup failure when chatPort is occupied must return exit code 1");
+            String errText = failErr.toString(StandardCharsets.UTF_8);
+            assertTrue(
+                    errText.contains("Failed to bind NIO live room-chat service on 127.0.0.1:" + chatPort),
+                    () -> "Expected occupied chat port error message, got:\n" + errText
+            );
+
+            // Verify roomsPort was rolled back and released immediately after chatPort bind failure
+            try (ServerSocket probeRoomsPort = new ServerSocket(
+                    roomsPort,
+                    10,
+                    InetAddress.getByName("127.0.0.1")
+            )) {
+                assertTrue(probeRoomsPort.isBound(), "roomsPort must be released when chatPort fails to bind");
+            }
+        }
+
+        // 2. Now both ports are free: run ServerMain in-process and verify both listeners start and stop cleanly
         CountDownLatch listeningLatch = new CountDownLatch(1);
         CountDownLatch stopSignal = new CountDownLatch(1);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -205,13 +246,15 @@ class ServerStarterAndSocketSmokeTest {
             ));
 
             assertTrue(listeningLatch.await(3, TimeUnit.SECONDS));
-            verifyHelloAndListRooms(roomsPort, "Amal");
+            verifyHelloListRoomsAndLiveChat(roomsPort, chatPort, "Amal");
 
             stopSignal.countDown();
             assertEquals(0, exitCodeFuture.get(3, TimeUnit.SECONDS));
             String stdout = out.toString(StandardCharsets.UTF_8);
             assertTrue(stdout.contains("TCP room-control service listening on 127.0.0.1:" + roomsPort));
+            assertTrue(stdout.contains("NIO live room-chat service listening on 127.0.0.1:" + chatPort));
             assertTrue(stdout.contains("TCP room-control service stopped (127.0.0.1:" + roomsPort + ")."));
+            assertTrue(stdout.contains("NIO live room-chat service stopped (127.0.0.1:" + chatPort + ")."));
         } finally {
             stopSignal.countDown();
             runner.shutdownNow();
@@ -289,7 +332,8 @@ class ServerStarterAndSocketSmokeTest {
         }
     }
 
-    private static void verifyHelloAndListRooms(int roomsPort, String displayName) throws IOException {
+    private static void verifyHelloListRoomsAndLiveChat(int roomsPort, int chatPort, String displayName)
+            throws IOException {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress("127.0.0.1", roomsPort), SOCKET_TIMEOUT_MS);
             socket.setSoTimeout(SOCKET_TIMEOUT_MS);
@@ -313,9 +357,11 @@ class ServerStarterAndSocketSmokeTest {
             assertEquals("hello-" + displayName, helloResp.get("id").getAsString());
 
             JsonObject helloBody = helloResp.getAsJsonObject("data");
-            assertTrue(helloBody.get("sessionId").getAsString().startsWith("s-"));
+            String sessionId = helloBody.get("sessionId").getAsString();
+            assertTrue(sessionId.startsWith("s-"));
             assertEquals(displayName, helloBody.get("displayName").getAsString());
             assertEquals(roomsPort, helloBody.getAsJsonObject("ports").get("roomsTcp").getAsInt());
+            assertEquals(chatPort, helloBody.getAsJsonObject("ports").get("chatNioTcp").getAsInt());
 
             JsonObject listReq = new JsonObject();
             listReq.addProperty("v", 1);
@@ -334,6 +380,63 @@ class ServerStarterAndSocketSmokeTest {
             assertEquals("netprog", rooms.get(0).getAsJsonObject().get("id").getAsString());
             assertEquals("revision", rooms.get(1).getAsJsonObject().get("id").getAsString());
             assertEquals("workshop", rooms.get(2).getAsJsonObject().get("id").getAsString());
+
+            // Join "netprog" so the shared RoomSessionRegistry authorizes CHAT_SUBSCRIBE on chatPort
+            JsonObject joinReq = new JsonObject();
+            joinReq.addProperty("v", 1);
+            joinReq.addProperty("id", "join-" + displayName);
+            joinReq.addProperty("op", "JOIN");
+            JsonObject joinData = new JsonObject();
+            joinData.addProperty("sessionId", sessionId);
+            joinData.addProperty("roomId", "netprog");
+            joinReq.add("data", joinData);
+
+            FrameCodec.writeFrame(out, joinReq);
+            JsonObject joinResp = FrameCodec.readFrame(in);
+            assertNotNull(joinResp);
+            assertTrue(joinResp.get("ok").getAsBoolean());
+            long revision = joinResp.getAsJsonObject("data").get("revision").getAsLong();
+            assertEquals(1L, revision);
+
+            try (Socket chatSocket = new Socket()) {
+                chatSocket.connect(new InetSocketAddress("127.0.0.1", chatPort), SOCKET_TIMEOUT_MS);
+                chatSocket.setSoTimeout(SOCKET_TIMEOUT_MS);
+                chatSocket.setTcpNoDelay(true);
+
+                InputStream chatIn = chatSocket.getInputStream();
+                OutputStream chatOut = chatSocket.getOutputStream();
+
+                RoomBinding binding = new RoomBinding(sessionId, "netprog", revision);
+                JsonObject subReq = ChatProtocol.buildSubscribeRequest("sub-" + displayName, binding);
+                FrameCodec.writeFrame(chatOut, subReq);
+                JsonObject subResp = FrameCodec.readFrame(chatIn);
+                assertNotNull(subResp);
+                assertTrue(subResp.get("ok").getAsBoolean(), () -> "SUBSCRIBE failed: " + subResp);
+
+                String expectedText = "smoke-chat-" + displayName;
+                JsonObject sendReq = ChatProtocol.buildChatSendRequest("send-" + displayName, expectedText);
+                FrameCodec.writeFrame(chatOut, sendReq);
+
+                // Read frames until both the CHAT_SEND acknowledgment and CHAT_EVENT push arrive
+                boolean sawSendAck = false;
+                boolean sawChatEvent = false;
+                for (int i = 0; i < 2; i++) {
+                    JsonObject frame = FrameCodec.readFrame(chatIn);
+                    assertNotNull(frame);
+                    if (frame.has("ok") && ("send-" + displayName).equals(frame.get("id").getAsString())) {
+                        assertTrue(frame.get("ok").getAsBoolean(), () -> "CHAT_SEND failed: " + frame);
+                        sawSendAck = true;
+                    } else if (ChatProtocol.OP_CHAT_EVENT.equals(frame.get("op").getAsString())) {
+                        ChatEvent event = ChatProtocol.parseChatEventFrame(frame);
+                        assertEquals("netprog", event.roomId());
+                        assertEquals(displayName, event.senderName());
+                        assertEquals(expectedText, event.text());
+                        sawChatEvent = true;
+                    }
+                }
+                assertTrue(sawSendAck, "Expected CHAT_SEND ack from ChatServer");
+                assertTrue(sawChatEvent, "Expected CHAT_EVENT broadcast from ChatServer");
+            }
 
             JsonObject quitReq = new JsonObject();
             quitReq.addProperty("v", 1);
@@ -425,7 +528,8 @@ class ServerStarterAndSocketSmokeTest {
         private final CountDownLatch listeningLatch = new CountDownLatch(1);
         private final CountDownLatch outputCompleteLatch = new CountDownLatch(1);
         private final Thread outputReaderThread;
-        private volatile String expectedEndpoint;
+        private volatile String expectedRoomsEndpoint;
+        private volatile String expectedChatEndpoint;
 
         private ManagedServerProcess(Process process) {
             this.process = process;
@@ -438,9 +542,7 @@ class ServerStarterAndSocketSmokeTest {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     outputBuffer.append(line).append(System.lineSeparator());
-                    String endpoint = this.expectedEndpoint;
-                    if (line.contains("TCP room-control service listening on ")
-                            && (endpoint == null || line.contains(endpoint))) {
+                    if (hasBothListeningLines(expectedRoomsEndpoint, expectedChatEndpoint)) {
                         listeningLatch.countDown();
                     }
                 }
@@ -450,16 +552,33 @@ class ServerStarterAndSocketSmokeTest {
             }
         }
 
+        private boolean hasBothListeningLines(String roomsEndpoint, String chatEndpoint) {
+            String text = outputBuffer.toString();
+            boolean roomsOk = (roomsEndpoint == null)
+                    ? text.contains("TCP room-control service listening on ")
+                    : text.contains("TCP room-control service listening on " + roomsEndpoint);
+            boolean chatOk = (chatEndpoint == null)
+                    ? text.contains("NIO live room-chat service listening on ")
+                    : text.contains("NIO live room-chat service listening on " + chatEndpoint);
+            return roomsOk && chatOk;
+        }
+
         private Process process() {
             return process;
         }
 
-        private boolean awaitListening(String endpoint, long timeout, TimeUnit unit) throws InterruptedException {
-            this.expectedEndpoint = endpoint;
-            if (outputBuffer.toString().contains("TCP room-control service listening on " + endpoint)) {
+        private boolean awaitListening(
+                String roomsEndpoint,
+                String chatEndpoint,
+                long timeout,
+                TimeUnit unit
+        ) throws InterruptedException {
+            this.expectedRoomsEndpoint = roomsEndpoint;
+            this.expectedChatEndpoint = chatEndpoint;
+            if (hasBothListeningLines(roomsEndpoint, chatEndpoint)) {
                 return true;
             }
-            return listeningLatch.await(timeout, unit);
+            return listeningLatch.await(timeout, unit) && hasBothListeningLines(roomsEndpoint, chatEndpoint);
         }
 
         private boolean awaitOutputComplete(long timeout, TimeUnit unit) throws InterruptedException {

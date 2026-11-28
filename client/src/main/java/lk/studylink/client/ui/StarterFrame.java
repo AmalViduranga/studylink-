@@ -23,6 +23,7 @@ import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.SwingConstants;
@@ -33,46 +34,70 @@ import lk.studylink.shared.model.FeatureServiceSpec;
 
 /**
  * Main Swing desktop window for the StudyLink student client rendered with FlatLaf Light on the
- * Swing Event Dispatch Thread (SRS Section 2, F02–F04, F13, T02).
+ * Swing Event Dispatch Thread (SRS Section 2, F02–F04, F06–F07, F13, T02, T04).
  *
- * <p>Hosts the interactive {@link RoomLifecyclePanel} for connecting to the TCP room-control server,
- * listing server-configured rooms, joining/switching/leaving one active study room at a time, and
- * disconnecting cleanly on user request or window close.
+ * <p>Hosts both Member 1's interactive {@link RoomLifecyclePanel} (TCP room control and session
+ * lifecycle) and Member 5's {@link ChatPanel} (Java NIO live room chat). Connecting and joining
+ * or switching a room automatically connects {@link ChatPanel} to the active room-control host and
+ * the {@code chatNioTcp} port returned by {@code HELLO}, while leaving, disconnecting, losing
+ * connection, or closing the window cleanly unsubscribes and disposes both services off the EDT.
  */
 public final class StarterFrame extends JFrame {
 
     private static final String UI_RESOURCE_PATH = "/studylink-ui.properties";
 
     private final RoomLifecyclePanel roomLifecyclePanel;
+    private final ChatPanel chatPanel;
     private final AtomicBoolean cleanedUp = new AtomicBoolean(false);
 
     public StarterFrame(StudyLinkConfig config, String configSource) {
-        this(config, configSource, new RoomClient(Objects.requireNonNull(config, "config must not be null")));
+        this(
+                config,
+                configSource,
+                new RoomClient(Objects.requireNonNull(config, "config must not be null")),
+                new ChatPanel(config)
+        );
     }
 
     public StarterFrame(StudyLinkConfig config, String configSource, RoomClient roomClient) {
+        this(
+                config,
+                configSource,
+                roomClient,
+                new ChatPanel(Objects.requireNonNull(config, "config must not be null"))
+        );
+    }
+
+    public StarterFrame(
+            StudyLinkConfig config,
+            String configSource,
+            RoomClient roomClient,
+            ChatPanel chatPanel
+    ) {
         Objects.requireNonNull(config, "config must not be null");
         Objects.requireNonNull(configSource, "configSource must not be null");
         Objects.requireNonNull(roomClient, "roomClient must not be null");
+        Objects.requireNonNull(chatPanel, "chatPanel must not be null");
 
         Properties uiProps = loadUiProperties();
         String title = uiProps.getProperty("app.title", "StudyLink Desktop Client");
         String subtitle = uiProps.getProperty(
                 "app.subtitle",
-                "Classroom LAN Study Collaboration — Room Control & Session Workspace (Java 21 + FlatLaf Light)"
+                "Classroom LAN Study Collaboration — Room Control & Live Room Chat Workspace (Java 21 + FlatLaf Light)"
         );
         String statusBanner = uiProps.getProperty(
                 "app.status.banner",
-                "TCP Room Control (M1) is active. Closing this window automatically disconnects any active session."
+                "TCP Room Control (M1) and Java NIO Live Room Chat (M5) are active. Closing this window disconnects any active session."
         );
-        int width = parseDimension(uiProps.getProperty("window.width"), 940);
-        int height = parseDimension(uiProps.getProperty("window.height"), 620);
+        int width = parseDimension(uiProps.getProperty("window.width"), 980);
+        int height = parseDimension(uiProps.getProperty("window.height"), 740);
 
         setTitle(title);
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         setPreferredSize(new Dimension(width, height));
 
-        this.roomLifecyclePanel = new RoomLifecyclePanel(config, roomClient);
+        this.chatPanel = chatPanel;
+        this.roomLifecyclePanel = new RoomLifecyclePanel(config, roomClient, chatPanel);
 
         addWindowListener(new WindowAdapter() {
             @Override
@@ -99,9 +124,22 @@ public final class StarterFrame extends JFrame {
         headerPanel.add(subtitleLabel, BorderLayout.SOUTH);
         root.add(headerPanel, BorderLayout.NORTH);
 
-        // Center content: Tab 1 = Interactive Room Session & Membership (M1), Tab 2 = Config & Endpoints
+        // Tab 1: Unified Room Session (M1) + Live Room Chat (M5) workspace
+        JPanel chatContainer = new JPanel(new BorderLayout());
+        chatContainer.setBorder(BorderFactory.createTitledBorder("4. Live Room Chat (Java NIO — M5)"));
+        chatContainer.add(chatPanel, BorderLayout.CENTER);
+
+        JSplitPane workspaceSplit = new JSplitPane(
+                JSplitPane.VERTICAL_SPLIT,
+                roomLifecyclePanel,
+                chatContainer
+        );
+        workspaceSplit.setResizeWeight(0.48);
+        workspaceSplit.setContinuousLayout(true);
+        workspaceSplit.setBorder(BorderFactory.createEmptyBorder());
+
         JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Room Session & Membership (M1)", roomLifecyclePanel);
+        tabs.addTab("Room Session & Live Chat (M1 + M5)", workspaceSplit);
         tabs.addTab("Configuration & Service Endpoints", buildOverviewTab(config, configSource));
         root.add(tabs, BorderLayout.CENTER);
 
@@ -131,6 +169,13 @@ public final class StarterFrame extends JFrame {
         return roomLifecyclePanel;
     }
 
+    /**
+     * Returns the embedded {@link ChatPanel} managing Java NIO live room chat.
+     */
+    public ChatPanel chatPanel() {
+        return chatPanel;
+    }
+
     @Override
     public void dispose() {
         cleanupRoomResources();
@@ -139,7 +184,11 @@ public final class StarterFrame extends JFrame {
 
     private void cleanupRoomResources() {
         if (cleanedUp.compareAndSet(false, true)) {
-            roomLifecyclePanel.dispose();
+            try {
+                roomLifecyclePanel.dispose();
+            } finally {
+                chatPanel.dispose();
+            }
         }
     }
 
@@ -197,9 +246,11 @@ public final class StarterFrame extends JFrame {
         };
 
         for (FeatureServiceSpec spec : services) {
-            String status = "M1".equals(spec.ownerCode())
-                    ? "Active (RoomClient + Swing Room Workspace)"
-                    : spec.status();
+            String status = switch (spec.ownerCode()) {
+                case "M1" -> "Active (RoomClient + Swing Room Workspace)";
+                case "M5" -> "Active (ChatClient + Swing Live Room Chat)";
+                default -> spec.status();
+            };
             model.addRow(new Object[]{
                     spec.ownerCode(),
                     spec.featureName(),
