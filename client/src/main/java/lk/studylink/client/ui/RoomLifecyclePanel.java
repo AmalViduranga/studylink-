@@ -461,8 +461,11 @@ public final class RoomLifecyclePanel extends JPanel {
     }
 
     /**
-     * Stops the UI liveness timer, closes the underlying {@link RoomClient} off the EDT, and shuts
-     * down the background worker executor. Safe and idempotent to call multiple times.
+     * Stops the UI liveness timer, immediately marks the panel disposed on the EDT, and closes
+     * the underlying {@link RoomClient} and worker executor off the EDT on an independent
+     * non-daemon cleanup thread so pending or active network operations are cancelled without
+     * blocking the Swing EDT. Safe and idempotent to call multiple times across
+     * {@code windowClosing}, {@code windowClosed}, and {@code dispose()}.
      */
     public void dispose() {
         if (!disposed.compareAndSet(false, true)) {
@@ -470,22 +473,25 @@ public final class RoomLifecyclePanel extends JPanel {
         }
         uiGeneration.incrementAndGet();
         livenessTimer.stop();
-        CompletableFuture<Void> closeTask = new CompletableFuture<>();
-        try {
-            workerExecutor.execute(() -> {
-                try {
-                    recordNetworkThread();
-                    roomClient.close();
-                } finally {
-                    closeTask.complete(null);
-                }
-            });
-            closeTask.get(1_500, TimeUnit.MILLISECONDS);
-        } catch (Exception ignored) {
-            roomClient.close();
-        } finally {
-            workerExecutor.shutdownNow();
-        }
+        runOnEdt(() -> {
+            recordUiUpdateThread();
+            operationInFlight = false;
+            applyDisconnectedStateOnEdt(
+                    "Disconnected from server. Display name released.",
+                    false
+            );
+        });
+
+        Thread cleanupThread = new Thread(() -> {
+            try {
+                recordNetworkThread();
+                roomClient.close();
+            } finally {
+                workerExecutor.shutdownNow();
+            }
+        }, "studylink-rooms-ui-cleanup");
+        cleanupThread.setDaemon(false);
+        cleanupThread.start();
     }
 
     // --- Component & state accessors for UI composition and tests ---

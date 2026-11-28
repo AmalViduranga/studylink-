@@ -3,13 +3,22 @@ package lk.studylink.client.ui;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.gson.JsonObject;
 import java.awt.GraphicsEnvironment;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
 import lk.studylink.server.rooms.RoomControlServer;
@@ -18,6 +27,7 @@ import lk.studylink.shared.config.StudyLinkConfig;
 import lk.studylink.shared.model.RoomBinding;
 import lk.studylink.shared.model.RoomDefinition;
 import lk.studylink.shared.model.SessionInfo;
+import lk.studylink.shared.protocol.FrameCodec;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -323,6 +333,120 @@ class RoomLifecyclePanelTest {
                 SessionInfo session = panel.connectAsync().get(5, TimeUnit.SECONDS).orElseThrow();
                 panel.dispose();
                 assertTrue(server.awaitSessionClosed(session.sessionId(), 2, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 15, unit = TimeUnit.SECONDS)
+    void disposingWindowDuringPendingHelloReturnsPromptlyOnEdtClosesPeerSocketAndCompletesPendingConnect()
+            throws Exception {
+        StudyLinkConfig config = StudyLinkConfig.srsDefaults();
+        CountDownLatch helloReceivedByPeer = new CountDownLatch(1);
+        CountDownLatch peerObservedSocketClosure = new CountDownLatch(1);
+        CountDownLatch releasePeerHold = new CountDownLatch(1);
+
+        try (ServerSocket delayedPeer = new ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))) {
+            Thread peerThread = Thread.ofVirtual().start(() -> {
+                try (Socket accepted = delayedPeer.accept();
+                        InputStream in = accepted.getInputStream()) {
+                    JsonObject helloReq = FrameCodec.readFrame(in);
+                    assertNotNull(helloReq);
+                    helloReceivedByPeer.countDown();
+
+                    // Hold the HELLO reply and wait until the client closes the socket during disposal
+                    try {
+                        JsonObject next = FrameCodec.readFrame(in);
+                        if (next == null) {
+                            peerObservedSocketClosure.countDown();
+                        }
+                    } catch (IOException expectedOnSocketClose) {
+                        peerObservedSocketClosure.countDown();
+                    }
+                    releasePeerHold.await(5, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+            });
+
+            AtomicReference<StarterFrame> frameRef = new AtomicReference<>();
+            AtomicReference<RoomLifecyclePanel> panelRef = new AtomicReference<>();
+            boolean hasDisplay = !GraphicsEnvironment.isHeadless();
+
+            SwingUtilities.invokeAndWait(() -> {
+                if (hasDisplay) {
+                    StarterFrame frame = new StarterFrame(config, "pending-hello-dispose-test");
+                    frameRef.set(frame);
+                    panelRef.set(frame.roomLifecyclePanel());
+                } else {
+                    panelRef.set(new RoomLifecyclePanel(config));
+                }
+                RoomLifecyclePanel panel = panelRef.get();
+                panel.hostField().setText("127.0.0.1");
+                panel.portField().setText(Integer.toString(delayedPeer.getLocalPort()));
+                panel.displayNameField().setText("Amal");
+            });
+
+            RoomLifecyclePanel panel = panelRef.get();
+            try {
+                CompletableFuture<Optional<SessionInfo>> pendingConnect = panel.connectAsync();
+                assertTrue(helloReceivedByPeer.await(3, TimeUnit.SECONDS), "Peer must receive HELLO frame");
+
+                CountDownLatch followUpEdtRan = new CountDownLatch(1);
+                AtomicLong edtDisposeElapsedMs = new AtomicLong(-1L);
+                long startNanos = System.nanoTime();
+
+                // Queue disposal on the EDT followed immediately by a second EDT event while HELLO reply is still held
+                SwingUtilities.invokeLater(() -> {
+                    long t0 = System.nanoTime();
+                    if (hasDisplay) {
+                        frameRef.get().dispose();
+                        frameRef.get().dispose(); // verify idempotence
+                    } else {
+                        panel.dispose();
+                        panel.dispose(); // verify idempotence
+                    }
+                    edtDisposeElapsedMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0));
+                });
+                SwingUtilities.invokeLater(followUpEdtRan::countDown);
+
+                boolean edtUnblocked = followUpEdtRan.await(2_500, TimeUnit.MILLISECONDS);
+                long totalEdtTurnaroundMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                System.out.printf(
+                        "[M1-06 Pending-HELLO Dispose Observation] edtDisposeElapsedMs=%d, totalEdtTurnaroundMs=%d%n",
+                        edtDisposeElapsedMs.get(),
+                        totalEdtTurnaroundMs
+                );
+
+                assertTrue(
+                        edtUnblocked && edtDisposeElapsedMs.get() >= 0L && totalEdtTurnaroundMs < 300L,
+                        "Disposing window/panel on EDT during pending HELLO blocked EDT for "
+                                + edtDisposeElapsedMs.get() + " ms (turnaround " + totalEdtTurnaroundMs + " ms)"
+                );
+
+                // Peer must observe socket closure while HELLO reply is still held
+                assertTrue(
+                        peerObservedSocketClosure.await(2, TimeUnit.SECONDS),
+                        "Peer must observe socket closure triggered off the EDT"
+                );
+
+                // Pending connect operation must finish cleanly with Optional.empty()
+                assertEquals(Optional.empty(), pendingConnect.get(2, TimeUnit.SECONDS));
+                assertTrue(panel.lastNetworkIoRanOffEdt(), "RoomClient.close() must not run on the Swing EDT");
+
+                SwingUtilities.invokeAndWait(() -> {
+                    assertFalse(panel.isConnectedInUi(), "Late callbacks must not restore connected UI state");
+                    assertEquals(Optional.empty(), panel.currentSession());
+                    assertEquals(Optional.empty(), panel.currentBinding());
+                    assertFalse(panel.connectButton().isEnabled(), "Disposed panel controls must remain disabled");
+                });
+            } finally {
+                releasePeerHold.countDown();
+                if (hasDisplay && frameRef.get() != null) {
+                    SwingUtilities.invokeAndWait(frameRef.get()::dispose);
+                } else {
+                    panel.dispose();
+                }
+                peerThread.join(2_000);
             }
         }
     }
